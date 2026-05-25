@@ -1,0 +1,375 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""
+fresh-docs — pull authoritative, version-current library docs.
+
+Single-file CLI, stdlib-only. The PEP 723 metadata block above lets `uv`
+launch this script directly via the shebang — no `pip install` needed.
+
+Install (two equivalent paths):
+  # Shebang + uv. Pin to a known-good revision in CI if you want stability.
+  curl -fsSL https://raw.githubusercontent.com/vkumar04/fresh-docs/main/fresh-docs \
+    -o ~/.local/bin/fresh-docs && chmod +x ~/.local/bin/fresh-docs
+
+  # OR install as a proper uv tool (drops `fresh-docs` on PATH):
+  uv tool install git+https://github.com/vkumar04/fresh-docs
+
+Subcommands:
+  llms <library> [--grep <pat>]    raw llms.txt fetch (no LLM pre-summary)
+  page <url>                       browser-UA HTTP GET + HTML strip
+  diff <library> <from> <to>       GH release notes between two semver tags
+
+Exit codes:
+  0   success
+  1   bad input / unresolved library
+  2   HTTP non-200 from upstream
+  3   subprocess failed (npm / gh)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+UA = "Mozilla/5.0 (compatible; fresh-docs/1.0)"
+TIMEOUT_S = 15
+
+# Verified 2026-05-25 via HEAD requests. Patch entries that flip to 404.
+# Mapped by both npm-package name AND tool name where they differ — so
+# `fresh-docs llms uv` and `fresh-docs llms @tanstack/react-query` both work.
+LLMS_URL_MAP: dict[str, str] = {
+    # JS/TS ecosystem
+    "ai": "https://ai-sdk.dev/llms.txt",
+    "@ai-sdk/react": "https://ai-sdk.dev/llms.txt",
+    "@ai-sdk/anthropic": "https://ai-sdk.dev/llms.txt",
+    "next": "https://nextjs.org/docs/llms.txt",
+    "react": "https://react.dev/llms.txt",
+    "@tanstack/react-query": "https://tanstack.com/llms.txt",
+    "@tanstack/react-table": "https://tanstack.com/llms.txt",
+    "prisma": "https://prisma.io/llms.txt",
+    "@prisma/client": "https://prisma.io/llms.txt",
+    "better-auth": "https://better-auth.com/llms.txt",
+    "zod": "https://zod.dev/llms.txt",
+    "shadcn": "https://ui.shadcn.com/llms.txt",
+    "shadcn-ui": "https://ui.shadcn.com/llms.txt",
+    "vercel": "https://vercel.com/docs/llms.txt",
+    "vitest": "https://vitest.dev/llms.txt",
+    "stripe": "https://docs.stripe.com/llms.txt",
+    "resend": "https://resend.com/llms.txt",
+    # Python ecosystem (so `uv view` style lookups can't poison this)
+    "uv": "https://docs.astral.sh/uv/llms.txt",
+    "ruff": "https://docs.astral.sh/ruff/llms.txt",
+}
+
+# When llms.txt is the "index" format (a list of `[title](url.md)` links
+# pointing at clean-markdown subpages), pass --subpage <regex> to drill in.
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+\.md)\)")
+
+
+def http_get(url: str) -> str:
+    """GET a URL with a real UA. Raises HTTPError on non-2xx."""
+    req = Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/plain, text/markdown, text/html;q=0.8, */*;q=0.5",
+        },
+    )
+    with urlopen(req, timeout=TIMEOUT_S) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def run(argv: list[str], timeout: int = 15) -> str:
+    """Run a subprocess, return stdout. Empty string on failure (caller decides)."""
+    try:
+        return subprocess.check_output(
+            argv, text=True, stderr=subprocess.DEVNULL, timeout=timeout
+        ).strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+# ── llms subcommand ────────────────────────────────────────────────
+
+
+def _autodiscover_llms_url(library: str) -> str | None:
+    """
+    Conservative auto-discovery via `npm view <lib> homepage`.
+
+    Defensive: dogfooding revealed that `npm view uv homepage` returns a
+    homepage for `github.com/micnic/uv` (a random JS package), which is
+    NOT the tool the user meant. Refuse the result if the homepage host
+    doesn't somehow reference the library name — otherwise return None
+    and let the user supply a URL via `page <url>` instead.
+    """
+    homepage = run(["bunx", "npm", "view", library, "homepage"])
+    if not homepage:
+        return None
+    # Library name must appear somewhere in the URL host or path. Scoped
+    # packages like @tanstack/react-query → strip the leading "@<scope>/".
+    bare = library.split("/")[-1].lower()
+    if bare in homepage.lower():
+        return homepage.rstrip("/") + "/llms.txt"
+    return None
+
+
+def cmd_llms(args: argparse.Namespace) -> int:
+    url = LLMS_URL_MAP.get(args.library) or _autodiscover_llms_url(args.library)
+    if not url:
+        print(
+            f"fresh-docs: no llms.txt URL for '{args.library}' "
+            "(not in map, npm has no matching homepage, or homepage doesn't "
+            f"reference '{args.library}'). "
+            "Add it to LLMS_URL_MAP or try `fresh-docs page <docs-url>`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        content = http_get(url)
+    except HTTPError as e:
+        print(f"fresh-docs: HTTP {e.code} from {url}", file=sys.stderr)
+        return 2
+    except URLError as e:
+        print(f"fresh-docs: network error fetching {url}: {e}", file=sys.stderr)
+        return 2
+
+    # If --subpage <regex>, look for index-format links and drill into the
+    # FIRST matching subpage. uv/Vercel docs use this pattern: the top-level
+    # llms.txt is an index of `[Title](https://.../index.md)` links.
+    if args.subpage:
+        sub_re = re.compile(args.subpage, re.IGNORECASE)
+        for label, suburl in _MD_LINK_RE.findall(content):
+            if sub_re.search(label) or sub_re.search(suburl):
+                try:
+                    content = http_get(suburl)
+                    url = suburl
+                    break
+                except (HTTPError, URLError) as e:
+                    print(
+                        f"fresh-docs: subpage fetch failed for {suburl}: {e}",
+                        file=sys.stderr,
+                    )
+                    return 2
+        else:
+            print(
+                f"fresh-docs: no subpage in {url} matched /{args.subpage}/i",
+                file=sys.stderr,
+            )
+            return 1
+
+    if not args.grep:
+        print(content)
+        return 0
+
+    # Extract ±2 / +20 line windows around each grep match. Coalesce adjacent
+    # windows so we don't repeat lines, and insert "…" markers between gaps.
+    pattern = re.compile(args.grep, re.IGNORECASE)
+    lines = content.splitlines()
+    blocks: list[str] = []
+    last_hi = -1
+    any_match = False
+    for i, line in enumerate(lines):
+        if pattern.search(line):
+            any_match = True
+            lo = max(last_hi + 1, i - 2)
+            hi = min(len(lines), i + 21)
+            if lo > last_hi + 1 and blocks:
+                blocks.append("…")
+            blocks.extend(lines[lo:hi])
+            last_hi = hi - 1
+    if not any_match:
+        print(f"fresh-docs: no match for /{args.grep}/i in {url}", file=sys.stderr)
+        return 1
+    print(f"# matches for /{args.grep}/i in {url}\n")
+    print("\n".join(blocks))
+    return 0
+
+
+# ── page subcommand ────────────────────────────────────────────────
+
+_SCRIPT_RE = re.compile(r"<script[\s\S]*?</script>", re.IGNORECASE)
+_STYLE_RE = re.compile(r"<style[\s\S]*?</style>", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\n\s*\n\s*\n+")
+
+
+def cmd_page(args: argparse.Namespace) -> int:
+    import html as _html  # stdlib; decode entities like &lt; → <
+
+    try:
+        content = http_get(args.url)
+    except HTTPError as e:
+        print(f"fresh-docs: HTTP {e.code} from {args.url}", file=sys.stderr)
+        return 2
+    except URLError as e:
+        print(f"fresh-docs: network error fetching {args.url}: {e}", file=sys.stderr)
+        return 2
+
+    text = _SCRIPT_RE.sub("", content)
+    text = _STYLE_RE.sub("", text)
+    text = _TAG_RE.sub("", text)
+    text = _html.unescape(text)  # &lt; → <, &amp; → &, &#x27; → ', etc.
+    text = _WS_RE.sub("\n\n", text).strip()
+    print(text)
+    return 0
+
+
+# ── diff subcommand ───────────────────────────────────────────────
+
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+]([^\s]*))?$")
+
+
+def parse_semver(s: str) -> tuple[int, int, int, tuple[str, ...]] | None:
+    """Comparable tuple from a semver string, or None on bad input."""
+    m = _SEMVER_RE.match(s.strip())
+    if not m:
+        return None
+    maj, minor, patch, pre = m.groups()
+    # Pre-releases sort BEFORE releases at the same maj.min.patch. Use "~"
+    # (sorts late ASCII) as the tiebreaker for non-pre versions.
+    pre_key: tuple[str, ...] = (pre,) if pre else ("~",)
+    return (int(maj), int(minor), int(patch), pre_key)
+
+
+_GITHUB_RE = re.compile(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?(?:/|$)")
+
+
+def resolve_github_repo(library: str) -> str | None:
+    """Resolve <owner>/<repo> via `npm view <lib> repository.url`."""
+    url = run(["bunx", "npm", "view", library, "repository.url"])
+    if not url:
+        return None
+    m = _GITHUB_RE.search(url)
+    return m.group(1) if m else None
+
+
+_BREAKING_BLOCK_RE = re.compile(
+    r"(?m)^(#{1,4})\s*[^\w\n]*\b(?:breaking)\b[\s\S]*?(?=^#{1,4}\s|\Z)",
+    re.IGNORECASE,
+)
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    owner_repo = resolve_github_repo(args.library)
+    if not owner_repo:
+        print(
+            f"fresh-docs: couldn't resolve '{args.library}' to a GitHub repo. "
+            "Check `bunx npm view <lib> repository.url`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    from_v = parse_semver(args.from_version)
+    to_v = parse_semver(args.to_version)
+    if not from_v or not to_v:
+        print(
+            f"fresh-docs: invalid semver — from='{args.from_version}' "
+            f"to='{args.to_version}'",
+            file=sys.stderr,
+        )
+        return 1
+    if from_v > to_v:
+        from_v, to_v = to_v, from_v
+
+    raw = run(
+        ["gh", "api", f"repos/{owner_repo}/releases", "--paginate"],
+        timeout=60,
+    )
+    if not raw:
+        print(
+            f"fresh-docs: `gh api` returned nothing for {owner_repo}. "
+            "Is `gh` authenticated? Try `gh auth status`.",
+            file=sys.stderr,
+        )
+        return 3
+
+    try:
+        releases = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"fresh-docs: couldn't parse gh output: {e}", file=sys.stderr)
+        return 3
+
+    in_range: list[tuple[tuple, str, str]] = []
+    for r in releases:
+        tag = r.get("tag_name") or ""
+        ver = parse_semver(tag)
+        if ver and from_v <= ver <= to_v:
+            in_range.append((ver, tag, r.get("body") or ""))
+
+    if not in_range:
+        print(
+            f"fresh-docs: no releases between {args.from_version} and "
+            f"{args.to_version} for {owner_repo}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    in_range.sort()
+    plural = "s" if len(in_range) != 1 else ""
+    print(
+        f"# {args.library}: {args.from_version} → {args.to_version} "
+        f"({len(in_range)} release{plural} from {owner_repo})\n"
+    )
+    for _, tag, body in in_range:
+        print(f"── {tag} ──")
+        breaking_matches = list(_BREAKING_BLOCK_RE.finditer(body))
+        if breaking_matches:
+            for m in breaking_matches:
+                print(m.group(0).strip())
+                print()
+        else:
+            head = "\n".join(body.splitlines()[:50])
+            print(head if head.strip() else "(no release notes)")
+        print()
+    return 0
+
+
+# ── argparse ──────────────────────────────────────────────────────
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="fresh-docs",
+        description="Pull authoritative, version-current library docs.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s_llms = sub.add_parser("llms", help="fetch llms.txt for a library (raw, no LLM summary)")
+    s_llms.add_argument("library", help="e.g. 'ai', '@tanstack/react-query', 'uv'")
+    s_llms.add_argument("--grep", help="extract sections matching this regex (case-insensitive)")
+    s_llms.add_argument(
+        "--subpage",
+        help=(
+            "when llms.txt is the index format (links to .md subpages), "
+            "drill into the first link matching this regex"
+        ),
+    )
+    s_llms.set_defaults(func=cmd_llms)
+
+    s_page = sub.add_parser("page", help="fetch any docs page with a browser UA + strip HTML")
+    s_page.add_argument("url")
+    s_page.set_defaults(func=cmd_page)
+
+    s_diff = sub.add_parser(
+        "diff", help="release notes between two semver tags (breaking-change-aware)"
+    )
+    s_diff.add_argument("library", help="npm package name")
+    s_diff.add_argument("from_version", metavar="from", help="e.g. 11.14.0")
+    s_diff.add_argument("to_version", metavar="to", help="e.g. 12.0.0")
+    s_diff.set_defaults(func=cmd_diff)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

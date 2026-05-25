@@ -1,6 +1,6 @@
 # fresh-docs
 
-A Claude Code skill for pulling **authoritative, version-current library documentation** without depending on any single source.
+A Claude Code skill + a single-file Python CLI for pulling **authoritative, version-current library documentation** without depending on any single docs source.
 
 ## Why
 
@@ -8,45 +8,81 @@ The default docs-search tools each have failure modes:
 
 - **context7** has a monthly quota that runs out mid-session.
 - **DevDocs.io** (and `dsearch` on top of it) misses many modern libraries — no TanStack Query, no react-hook-form, no Vercel AI SDK, no Motion.
-- **WebFetch on Google** is slow and noisy.
+- **WebFetch** runs a small fast model to pre-summarize, which on long `llms.txt` files drops critical detail (it told us `Output.object` was deprecated in Vercel AI SDK v6 — it wasn't).
+- **WebFetch** also fails on `403 Forbidden` from sites that filter its user agent (react-hook-form.com).
+- **Hand-written `jq` filters** on GitHub release tags do lexicographic comparison, which is broken for semver (`"v11.14.0"` is lex-less than `"v11.5.0"`).
 
-Most maintainers of modern libraries publish `llms.txt` — a single curated text file specifically designed for LLM consumption. When it exists, it's the gold path. `fresh-docs` routes there first, then falls back to GitHub Releases / raw CHANGELOG at the installed version tag / official docs WebFetch.
+Most modern libraries publish `llms.txt` — a single curated text file specifically designed for LLM consumption. When it exists, it's the gold path. `fresh-docs` routes there first, then falls back to GitHub Releases (with proper semver), CHANGELOG/MIGRATING at the version tag, official-docs WebFetch (with a real UA), or npm README.
 
 ## Install
 
-Drop the `SKILL.md` into your Claude Code skills directory:
+The CLI is a single-file Python 3.10+ script with a PEP 723 inline-metadata block and a `#!/usr/bin/env -S uv run --script` shebang. It launches via `uv` with zero `pip install` overhead.
+
+**Prerequisite**: `uv` (`brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`).
 
 ```bash
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/vkumar04/fresh-docs/main/fresh-docs \
+  -o ~/.local/bin/fresh-docs
+chmod +x ~/.local/bin/fresh-docs
+
+# Make sure ~/.local/bin is on PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+# Drop the Claude Code skill into place too:
 mkdir -p ~/.claude/skills/fresh-docs
 curl -fsSL https://raw.githubusercontent.com/vkumar04/fresh-docs/main/SKILL.md \
   -o ~/.claude/skills/fresh-docs/SKILL.md
 ```
 
-Restart your Claude Code session (or wait for skills to reload). Then:
+Verify:
 
-```
-/fresh-docs ai streamText
-/fresh-docs next 16 migration
-/fresh-docs @tanstack/react-query useMutation
+```bash
+fresh-docs --help
+fresh-docs llms ai --grep "stopWhen"
 ```
 
-## What it does
+Restart your Claude Code session (or wait for skills to reload). Then `/fresh-docs <library> <topic>` becomes a first-class command.
+
+## CLI subcommands
+
+```bash
+# Raw llms.txt fetch — no LLM pre-summary, optional grep extraction
+fresh-docs llms <library>
+fresh-docs llms <library> --grep <regex>
+fresh-docs llms <library> --subpage <regex>   # for index-format llms.txt
+
+# Any docs page — browser UA, HTML strip + entity decode
+fresh-docs page <url>
+
+# GitHub release notes between two semver tags (breaking-change-aware)
+fresh-docs diff <library> <fromVersion> <toVersion>
+```
+
+Examples:
+
+```bash
+fresh-docs llms ai --grep "stopWhen"                          # AI SDK v6 stop predicate
+fresh-docs llms uv --subpage "scripts"                        # uv PEP 723 inline metadata
+fresh-docs llms @tanstack/react-query --grep "isPending"      # v5 mutation pending flag
+fresh-docs page "https://react-hook-form.com/docs/useform"    # site that 403s WebFetch
+fresh-docs diff @testcontainers/postgresql 11.14.0 12.0.0     # v11→v12 breaking changes
+```
+
+## What the skill does
 
 For a given library + topic, tries sources in order of signal density and stops at the first one that confidently answers:
 
 ```
-1. llms.txt (when published)              ← AI-curated, current, terse
-2. GitHub Releases API for installed tag  ← changelog distilled by maintainers
-3. CHANGELOG.md / MIGRATING.md at tag     ← raw maintainer notes
-4. Official docs WebFetch (specific page) ← human-readable, may be slightly stale
-5. npm registry README                    ← bare minimum, but version-pinned
+1. llms.txt (raw `curl` or `fresh-docs llms`)    ← AI-curated, current, terse
+2. GitHub Releases API for installed tag         ← changelog distilled by maintainers
+3. CHANGELOG.md / MIGRATING.md at tag            ← raw maintainer notes
+   3.5. `fresh-docs diff` shortcut               ← release notes between two tags
+4. Official docs WebFetch (specific page)        ← human-readable, may be slightly stale
+5. npm registry README                           ← bare minimum, but version-pinned
 ```
 
-The skill maintains a vetted map of canonical doc URLs and known-good `llms.txt` endpoints for the libraries we ship most often:
-
-- **Vercel AI SDK**, `@ai-sdk/*`, **Next.js**, **React**, **TanStack Query/Table**, **Prisma**, **better-auth**, **zod**, **shadcn-ui**, **Vitest**, **Stripe**, **Resend** — `llms.txt` available
-- **react-hook-form**, **Motion**, **Tailwind CSS**, **Playwright** — no `llms.txt`, falls through to targeted WebFetch
-- Anything else — tries `<homepage>/llms.txt` (from `npm view`), then GitHub README at the version tag
+The skill ships a vetted map of canonical `llms.txt` endpoints (20+ libraries verified 2026-05-25) and known fallback paths for the libraries we ship most often.
 
 ## When to use it
 
@@ -75,7 +111,7 @@ When the skill answers from training, it says so — *"From training (Jan 2026 c
 
 ## Verifying / extending the URL map
 
-The skill body ships a vetted table of known `llms.txt` endpoints. If a vendor changes their URL, edit `SKILL.md` and update the row.
+The skill body + the CLI both ship a vetted table of known `llms.txt` endpoints. If a vendor changes their URL, edit `SKILL.md` and `fresh-docs` (the `LLMS_URL_MAP` dict near the top), then re-publish.
 
 Quick check:
 

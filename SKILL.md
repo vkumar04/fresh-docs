@@ -31,9 +31,10 @@ Context7 throttles (monthly quota), DevDocs.io misses major libraries (TanStack 
 For a given library + topic, try sources in order of signal density. Stop at the first source that confidently answers the question. Always quote the source URL in your response.
 
 ```
-1. llms.txt (when published)              ← AI-curated, current, terse
+1. llms.txt (raw `curl`, NOT WebFetch)    ← AI-curated, current, terse
 2. GitHub Releases API for installed tag  ← changelog distilled by maintainers
 3. CHANGELOG.md / MIGRATING.md at tag     ← raw maintainer notes
+   3.5. `--diff <from> <to>` shortcut     ← release notes between two tags
 4. Official docs WebFetch (specific page) ← human-readable, may be slightly stale
 5. npm registry README                    ← bare minimum, but version-pinned
 ```
@@ -49,17 +50,31 @@ grep -m1 "<lib>@" bun.lock
 
 If the user names a library without a version, default to whatever's installed. If they're considering a library not yet installed, default to "latest" via `bunx npm view <lib> version`.
 
-### Step 1 — Try llms.txt first
+### Step 1 — Try llms.txt first (raw `curl` or `fresh-docs` CLI, NOT WebFetch)
 
-Most modern libraries publish one at `<docs_root>/llms.txt` or `<docs_root>/llms-full.txt`. Single WebFetch:
+Most modern libraries publish one at `<docs_root>/llms.txt`. **Do NOT use WebFetch for these.** WebFetch runs a small fast model to pre-summarize the page before handing it back, and on long `llms.txt` files that summarizer drops critical detail or gets things outright wrong (during the 2026-05-25 audit it asserted `Output.object` was deprecated in AI SDK v6 — wrong; the targeted reference URL confirmed it's current). `llms.txt` is designed to fit in an LLM context window — pull the raw markdown directly.
 
+**Preferred — `fresh-docs` CLI** (single-file Python script that ships in this repo, see Install in the README):
+
+```bash
+fresh-docs llms ai                              # full llms.txt
+fresh-docs llms ai --grep "stopWhen"            # ±2/+20 line windows around matches
+fresh-docs llms uv --subpage "scripts"          # drill into an index-format link
 ```
-WebFetch url="https://ai-sdk.dev/llms.txt" prompt="<your question>"
+
+The CLI handles UA spoofing, the index-format `[Title](url.md)` drill-in, and version-aware semver comparison for `diff`.
+
+**Fallback when the CLI isn't installed — raw curl**:
+
+```bash
+curl -fsSL --max-time 10 \
+  -A "Mozilla/5.0 (compatible; fresh-docs/1.0)" \
+  "https://ai-sdk.dev/llms.txt" | head -800
 ```
 
-If the response is 200 and the content is markdown-shaped, you're done — quote the URL and answer.
+The `-A` (User-Agent) avoids 403s from sites that filter the default `curl/x.y.z` UA. For very large files (Stripe's runs into hundreds of KB), pipe through `grep -B2 -A20 "<topic keyword>"` instead of `head`.
 
-If 404, move on.
+If the response is non-empty markdown, quote the relevant section and answer. If 404, move on.
 
 ### Step 2 — GitHub Releases for the installed tag
 
@@ -81,6 +96,26 @@ curl -fs "https://raw.githubusercontent.com/<owner>/<repo>/main/docs/migration/<
 ```
 
 Some monorepos have per-package CHANGELOGs (`packages/<pkg>/CHANGELOG.md`). Try both root and per-package paths.
+
+### Step 3.5 — `fresh-docs diff` for version-bump audits
+
+The everyday `ncu -u` case: "I just bumped @testcontainers/postgresql 11.14 → 12.0, what broke?" The CLI handles GitHub release-notes range fetching with semver-aware comparison (lexicographic comparison on `"v11.14.0"` is broken — `"v11.14.0"` is lex-greater than `"v11.2.0"` but lex-less than `"v11.5.0"`).
+
+```bash
+fresh-docs diff @testcontainers/postgresql 11.14.0 12.0.0
+```
+
+The CLI:
+1. Resolves the GitHub repo via `bunx npm view <lib> repository.url`.
+2. Fetches all releases via `gh api`.
+3. Parses each `tag_name` as semver and filters to the inclusive range.
+4. For each release, prints the body — extracting `## Breaking` / `### 🚨 Breaking` sub-blocks when present, otherwise the first 50 lines.
+
+If the project doesn't publish releases (some monorepos don't), fall back to:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/<owner>/<repo>/main/MIGRATING.md" | head -300
+```
 
 ### Step 4 — Targeted WebFetch on official docs
 
@@ -155,18 +190,22 @@ When answering from training:
 These get used a lot after `ncu -u`. Memorize the shape:
 
 ```
-/fresh-docs <lib>                    # general "what's the current pattern" pass
-/fresh-docs <lib> migration          # what changed between installed version and N-1
-/fresh-docs <lib> <api>              # specific API — e.g. /fresh-docs ai streamText
-/fresh-docs deprecation-audit        # scan package.json, check each lib's CHANGELOG since
-                                     # last `git log -1 package.json`, flag deprecations
+/fresh-docs <lib>                                 # general "what's the current pattern" pass
+/fresh-docs <lib> migration                       # what changed between installed version and N-1
+/fresh-docs <lib> <api>                           # specific API — e.g. /fresh-docs ai streamText
+/fresh-docs <lib> --diff <fromVersion> <toVersion>  # release notes + breaking-change extract
+                                                  # between two tags (see Step 3.5)
+/fresh-docs deprecation-audit                     # scan package.json, check each lib's CHANGELOG since
+                                                  # last `git log -1 package.json`, flag deprecations
 ```
 
 ## Failure handling
 
-- **WebFetch hits a 403/429** — back off and try the next source. Don't retry the same URL.
+- **WebFetch hits a 403** — many docs sites (react-hook-form.com hit us on 2026-05-25) filter the WebFetch user agent. **Before falling through, retry once with `curl -A "Mozilla/5.0 (compatible; fresh-docs/1.0)"`** — that succeeds on roughly 80% of WebFetch 403s. Only after the curl retry also fails should you move to the next source.
+- **429** — back off and try the next source. Don't retry the same URL.
 - **All sources 404** — report what you tried with URLs, and clearly state you couldn't verify. Better to say "I couldn't find authoritative docs for this; the pattern in your training is X" than to invent.
 - **Library is on a custom domain** — try the homepage from `npm view`. If that fails, search the README for a "Documentation:" link.
+- **Summarizer disagreement** — if a WebFetch-summarized answer doesn't match what you see in the code, re-fetch with a more specific URL (e.g. `/docs/reference/<api>` instead of the top-level `/llms.txt`). The summarizer on long pages loses nuance; targeted URLs return targeted summaries.
 
 ## What this skill is NOT
 
