@@ -36,6 +36,7 @@ import json
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -502,6 +503,13 @@ def cmd_audit(args: argparse.Namespace) -> int:
         set(args.packages.split(",")) if args.packages else None
     )
 
+    # --flag-breaking-only implicitly turns on include-patch + fetch-diffs:
+    # we have to fetch every dep's release notes (including patches) to
+    # detect any release with a "## Breaking" block.
+    if args.flag_breaking_only:
+        args.include_patch = True
+        args.fetch_diffs = True
+
     changes: list[dict] = []
     for name, new_ver in cur_deps.items():
         old_ver = prev_deps.get(name)
@@ -524,15 +532,49 @@ def cmd_audit(args: argparse.Namespace) -> int:
             "diff": None,
         })
 
-    if args.fetch_diffs:
-        for c in changes:
-            _, diff_result = _do_diff(c["library"], c["from"], c["to"])
-            c["diff"] = diff_result
+    if args.fetch_diffs and changes:
+        # Parallelize `gh` calls — each _do_diff spends most of its time
+        # waiting on GitHub. 8 workers is a sweet spot: well under the
+        # default 5000/hr rate limit, and most ncu -u bumps touch < 25 deps.
+        # The total time becomes ceil(N/8) * (slowest dep), not N * (avg).
+        worker_count = min(8, len(changes))
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            futures = {
+                ex.submit(_do_diff, c["library"], c["from"], c["to"]): c
+                for c in changes
+            }
+            for future in as_completed(futures):
+                c = futures[future]
+                try:
+                    _, diff_result = future.result()
+                    c["diff"] = diff_result
+                except Exception as e:
+                    c["diff"] = {
+                        "library": c["library"],
+                        "from": c["from"],
+                        "to": c["to"],
+                        "repo": None,
+                        "releases": [],
+                        "error": f"worker exception: {e}",
+                    }
+
+    # --flag-breaking-only: drop any change that has zero breaking blocks
+    # across all its releases. Patches that pass this gate are the rare
+    # truly-risky bumps — the whole reason to scan patches in the first place.
+    if args.flag_breaking_only:
+        changes = [
+            c for c in changes
+            if c.get("diff") and any(
+                r.get("breaking_blocks")
+                for r in c["diff"].get("releases", [])
+            )
+        ]
 
     report = {
         "from_ref": prev_ref,
         "to_ref": "HEAD",
         "include_patch": bool(args.include_patch),
+        "flag_breaking_only": bool(args.flag_breaking_only),
         "package_filter": sorted(package_filter) if package_filter else None,
         "changes": changes,
     }
@@ -542,15 +584,18 @@ def cmd_audit(args: argparse.Namespace) -> int:
         return 0
 
     if not changes:
-        print(
-            f"fresh-docs audit: no non-patch changes between {prev_ref[:8]} "
-            "and HEAD"
-            + (
-                " (within --packages filter)"
-                if package_filter
-                else ""
+        if args.flag_breaking_only:
+            print(
+                f"fresh-docs audit: no releases with breaking-change blocks "
+                f"between {prev_ref[:8]} and HEAD across "
+                f"{sum(1 for _ in cur_deps)} dependencies. All clear."
             )
-        )
+        else:
+            kind = "non-patch changes" if not args.include_patch else "changes"
+            print(
+                f"fresh-docs audit: no {kind} between {prev_ref[:8]} and HEAD"
+                + (" (within --packages filter)" if package_filter else "")
+            )
         return 0
 
     print(
@@ -652,7 +697,16 @@ def main() -> int:
     s_audit.add_argument(
         "--fetch-diffs",
         action="store_true",
-        help="for each changed dep, also pull GH release notes (slow on monorepos)",
+        help="for each changed dep, also pull GH release notes (parallel, 8 workers)",
+    )
+    s_audit.add_argument(
+        "--flag-breaking-only",
+        action="store_true",
+        help=(
+            "scan ALL bumps (incl. patch) and report only those whose release "
+            "notes contain a `## Breaking` block — catches the rare safety-"
+            "relevant patch. Implies --include-patch + --fetch-diffs."
+        ),
     )
     s_audit.add_argument(
         "--json",
