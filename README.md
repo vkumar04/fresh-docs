@@ -18,7 +18,7 @@ Drop the `SKILL.md` into your Claude Code skills directory:
 
 ```bash
 mkdir -p ~/.claude/skills/fresh-docs
-curl -fsSL https://raw.githubusercontent.com/<owner>/fresh-docs/main/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/vkumar04/fresh-docs/main/SKILL.md \
   -o ~/.claude/skills/fresh-docs/SKILL.md
 ```
 
