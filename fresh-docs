@@ -285,125 +285,307 @@ _BREAKING_BLOCK_RE = re.compile(
 )
 
 
-def cmd_diff(args: argparse.Namespace) -> int:
-    owner_repo = resolve_github_repo(args.library)
-    if not owner_repo:
-        print(
-            f"fresh-docs: couldn't resolve '{args.library}' to a GitHub repo. "
-            "Check `bunx npm view <lib> repository.url`.",
-            file=sys.stderr,
-        )
-        return 1
+def _do_diff(
+    library: str, from_version: str, to_version: str
+) -> tuple[int, dict]:
+    """
+    Shared core of cmd_diff. Returns (exit_code, result_dict).
+    Used by both `cmd_diff` (prints to stdout) and `cmd_audit` (aggregates
+    multiple diffs into one report).
+    """
+    result: dict = {
+        "library": library,
+        "from": from_version,
+        "to": to_version,
+        "repo": None,
+        "releases": [],
+        "error": None,
+    }
 
-    from_v = parse_semver(args.from_version)
-    to_v = parse_semver(args.to_version)
-    if not from_v or not to_v:
-        print(
-            f"fresh-docs: invalid semver — from='{args.from_version}' "
-            f"to='{args.to_version}'",
-            file=sys.stderr,
+    owner_repo = resolve_github_repo(library)
+    if not owner_repo:
+        result["error"] = (
+            f"couldn't resolve '{library}' to a GitHub repo via npm"
         )
-        return 1
+        return 1, result
+    result["repo"] = owner_repo
+
+    from_v = parse_semver(from_version)
+    to_v = parse_semver(to_version)
+    if not from_v or not to_v:
+        result["error"] = (
+            f"invalid semver: from='{from_version}' to='{to_version}'"
+        )
+        return 1, result
     if from_v > to_v:
         from_v, to_v = to_v, from_v
+        from_version, to_version = to_version, from_version
+        result["from"], result["to"] = from_version, to_version
 
-    # Two-stage fetch to handle huge monorepos:
-    #
-    # Stage 1: `gh release list` returns just tagName + publishedAt for the
-    #          most recent N releases. Cheap (~KB) and fast. We use --limit
-    #          5000 so even Changesets monorepos like vercel/ai (which fire
-    #          a release on every package, ~12MB total) stay manageable.
-    #
-    # Stage 2: for each tag actually in our version range AND matching this
-    #          library, fetch the body via `gh release view`. Tiny per call.
-    #
-    # The alternative (`gh api repos/<r>/releases --paginate`) buffers every
-    # release body — 12+ MB on big monorepos — and trips subprocess timeouts.
     raw = run(
         [
-            "gh",
-            "release",
-            "list",
-            "--repo",
-            owner_repo,
-            "--limit",
-            "5000",
-            "--json",
-            "tagName,publishedAt",
+            "gh", "release", "list",
+            "--repo", owner_repo,
+            "--limit", "5000",
+            "--json", "tagName,publishedAt",
         ],
         timeout=60,
     )
     if not raw:
-        print(
-            f"fresh-docs: `gh release list` returned nothing for {owner_repo}. "
-            "Is `gh` authenticated? Try `gh auth status`.",
-            file=sys.stderr,
+        result["error"] = (
+            f"`gh release list` returned nothing for {owner_repo} "
+            "(is `gh` authenticated?)"
         )
-        return 3
+        return 3, result
 
     try:
         tag_meta = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"fresh-docs: couldn't parse gh output: {e}", file=sys.stderr)
-        return 3
+        result["error"] = f"couldn't parse gh output: {e}"
+        return 3, result
 
-    # Filter to in-range, library-matching tags first (cheap).
     matching_tags: list[tuple[tuple, str]] = []
     for t in tag_meta:
         tag = t.get("tagName") or ""
         ver = parse_semver(tag)
         if not ver or not (from_v <= ver <= to_v):
             continue
-        if not tag_matches_library(tag, args.library):
+        if not tag_matches_library(tag, library):
             continue
         matching_tags.append((ver, tag))
 
     if not matching_tags:
-        # Fall back to single-tag fetch in case the tag uses an unusual prefix
-        # the filter didn't recognize. This lets a user manually pass exact
-        # tags like `ai@6.0.191` and get something useful back.
-        print(
-            f"fresh-docs: no tags in {owner_repo} match {args.library} between "
-            f"{args.from_version} and {args.to_version} (scanned {len(tag_meta)} "
-            "releases). If this is a monorepo, check the tag format with "
-            f"`gh release list --repo {owner_repo} --limit 5`.",
-            file=sys.stderr,
+        result["error"] = (
+            f"no tags in {owner_repo} match {library} between "
+            f"{from_version} and {to_version} (scanned {len(tag_meta)} releases)"
         )
-        return 1
+        return 1, result
 
-    # Now fetch the body for each in-range tag.
-    in_range: list[tuple[tuple, str, str]] = []
+    matching_tags.sort()
     for ver, tag in matching_tags:
         body = run(
             ["gh", "release", "view", tag, "--repo", owner_repo, "--json", "body", "--jq", ".body"],
             timeout=15,
         )
-        in_range.append((ver, tag, body or ""))
+        breaking_blocks = [m.group(0).strip() for m in _BREAKING_BLOCK_RE.finditer(body or "")]
+        version_str = ".".join(str(x) for x in ver[:3])
+        if ver[3] != ("~",):
+            version_str += "-" + ver[3][0]
+        result["releases"].append({
+            "tag": tag,
+            "version": version_str,
+            "body": body or "",
+            "breaking_blocks": breaking_blocks,
+        })
+    return 0, result
 
-    if not in_range:
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    code, result = _do_diff(args.library, args.from_version, args.to_version)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return code
+
+    if result["error"]:
+        print(f"fresh-docs: {result['error']}", file=sys.stderr)
+        return code
+
+    releases = result["releases"]
+    plural = "s" if len(releases) != 1 else ""
+    print(
+        f"# {result['library']}: {result['from']} → {result['to']} "
+        f"({len(releases)} release{plural} from {result['repo']})\n"
+    )
+    for r in releases:
+        print(f"── {r['tag']} ──")
+        if r["breaking_blocks"]:
+            for block in r["breaking_blocks"]:
+                print(block)
+                print()
+        else:
+            head = "\n".join(r["body"].splitlines()[:50])
+            print(head if head.strip() else "(no release notes)")
+        print()
+    return 0
+
+
+# ── audit subcommand ──────────────────────────────────────────────
+
+
+def _read_package_json(path_or_ref: str) -> dict | None:
+    """
+    Read package.json from disk OR from a git ref (e.g. "HEAD~1").
+    Returns parsed JSON, or None on failure.
+    """
+    if path_or_ref in ("HEAD", "main") or path_or_ref.startswith("HEAD~") \
+       or re.match(r"^[0-9a-f]{4,}$", path_or_ref):
+        raw = run(["git", "show", f"{path_or_ref}:package.json"], timeout=10)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    try:
+        with open(path_or_ref) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _strip_semver_prefix(v: str) -> str:
+    """`^1.2.3` → `1.2.3`, `~1.2.3` → `1.2.3`, `>=1.2.3` → `1.2.3`."""
+    return re.sub(r"^[\^~>=<\s]+", "", v).strip()
+
+
+def _bump_type(old: str, new: str) -> str:
+    """Classify a version bump: 'major', 'minor', 'patch', or 'unknown'."""
+    o = parse_semver(_strip_semver_prefix(old))
+    n = parse_semver(_strip_semver_prefix(new))
+    if not o or not n:
+        return "unknown"
+    if o[0] != n[0]:
+        return "major"
+    if o[1] != n[1]:
+        return "minor"
+    if o[2] != n[2]:
+        return "patch"
+    return "unknown"
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """
+    Diff the project's package.json against a prior commit and report what
+    changed. Default: against the second-most-recent commit that touched
+    package.json (i.e. "what did the last bump change?").
+    """
+    if args.since:
+        prev_ref = args.since
+    else:
+        log = run(
+            ["git", "log", "--format=%H", "-n", "5", "--", "package.json"],
+            timeout=10,
+        )
+        commits = [c for c in log.splitlines() if c]
+        if len(commits) < 2:
+            print(
+                "fresh-docs: no prior package.json revision to diff against. "
+                "Pass --since <ref> explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        prev_ref = commits[1]
+
+    current = _read_package_json("package.json")
+    if not current:
+        print("fresh-docs: couldn't read ./package.json", file=sys.stderr)
+        return 1
+    previous = _read_package_json(prev_ref)
+    if not previous:
         print(
-            f"fresh-docs: no releases between {args.from_version} and "
-            f"{args.to_version} for {owner_repo}.",
+            f"fresh-docs: couldn't read package.json at {prev_ref}",
             file=sys.stderr,
         )
         return 1
 
-    in_range.sort()
-    plural = "s" if len(in_range) != 1 else ""
-    print(
-        f"# {args.library}: {args.from_version} → {args.to_version} "
-        f"({len(in_range)} release{plural} from {owner_repo})\n"
+    def _all_deps(pkg: dict) -> dict[str, str]:
+        return {
+            **(pkg.get("dependencies") or {}),
+            **(pkg.get("devDependencies") or {}),
+        }
+
+    cur_deps = _all_deps(current)
+    prev_deps = _all_deps(previous)
+
+    package_filter = (
+        set(args.packages.split(",")) if args.packages else None
     )
-    for _, tag, body in in_range:
-        print(f"── {tag} ──")
-        breaking_matches = list(_BREAKING_BLOCK_RE.finditer(body))
-        if breaking_matches:
-            for m in breaking_matches:
-                print(m.group(0).strip())
-                print()
-        else:
-            head = "\n".join(body.splitlines()[:50])
-            print(head if head.strip() else "(no release notes)")
+
+    changes: list[dict] = []
+    for name, new_ver in cur_deps.items():
+        old_ver = prev_deps.get(name)
+        if not old_ver or old_ver == new_ver:
+            continue
+        old_clean = _strip_semver_prefix(old_ver)
+        new_clean = _strip_semver_prefix(new_ver)
+        if old_clean == new_clean:
+            continue
+        if package_filter and name not in package_filter:
+            continue
+        bump = _bump_type(old_clean, new_clean)
+        if bump == "patch" and not args.include_patch:
+            continue
+        changes.append({
+            "library": name,
+            "from": old_clean,
+            "to": new_clean,
+            "bump_type": bump,
+            "diff": None,
+        })
+
+    if args.fetch_diffs:
+        for c in changes:
+            _, diff_result = _do_diff(c["library"], c["from"], c["to"])
+            c["diff"] = diff_result
+
+    report = {
+        "from_ref": prev_ref,
+        "to_ref": "HEAD",
+        "include_patch": bool(args.include_patch),
+        "package_filter": sorted(package_filter) if package_filter else None,
+        "changes": changes,
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    if not changes:
+        print(
+            f"fresh-docs audit: no non-patch changes between {prev_ref[:8]} "
+            "and HEAD"
+            + (
+                " (within --packages filter)"
+                if package_filter
+                else ""
+            )
+        )
+        return 0
+
+    print(
+        f"# fresh-docs audit: {len(changes)} change"
+        f"{'s' if len(changes) != 1 else ''} "
+        f"from {prev_ref[:8]} → HEAD\n"
+    )
+    bump_counts: dict[str, int] = {}
+    for c in changes:
+        bump_counts[c["bump_type"]] = bump_counts.get(c["bump_type"], 0) + 1
+    summary = ", ".join(f"{n} {k}" for k, n in sorted(bump_counts.items()))
+    print(f"## Summary: {summary}\n")
+
+    by_bump: dict[str, list[dict]] = {"major": [], "minor": [], "patch": [], "unknown": []}
+    for c in changes:
+        by_bump.setdefault(c["bump_type"], []).append(c)
+    for kind in ("major", "minor", "patch", "unknown"):
+        if not by_bump[kind]:
+            continue
+        print(f"## {kind.title()} bumps ({len(by_bump[kind])})")
+        for c in by_bump[kind]:
+            line = f"  - {c['library']}: {c['from']} → {c['to']}"
+            if c.get("diff") and c["diff"].get("releases"):
+                rels = c["diff"]["releases"]
+                breaking_count = sum(
+                    len(r["breaking_blocks"]) for r in rels
+                )
+                line += f"  ({len(rels)} releases"
+                if breaking_count:
+                    line += f", {breaking_count} breaking block"
+                    line += "s" if breaking_count != 1 else ""
+                line += ")"
+            elif c.get("diff") and c["diff"].get("error"):
+                line += f"  (diff unavailable: {c['diff']['error'][:60]}…)"
+            print(line)
         print()
     return 0
 
@@ -440,7 +622,44 @@ def main() -> int:
     s_diff.add_argument("library", help="npm package name")
     s_diff.add_argument("from_version", metavar="from", help="e.g. 11.14.0")
     s_diff.add_argument("to_version", metavar="to", help="e.g. 12.0.0")
+    s_diff.add_argument(
+        "--json",
+        action="store_true",
+        help="emit structured output (releases, breaking_blocks) for CI / audit consumers",
+    )
     s_diff.set_defaults(func=cmd_diff)
+
+    s_audit = sub.add_parser(
+        "audit",
+        help=(
+            "diff the project's package.json against a prior commit "
+            "and report dep changes by bump type"
+        ),
+    )
+    s_audit.add_argument(
+        "--since",
+        help="git ref to diff against (default: second-most-recent commit touching package.json)",
+    )
+    s_audit.add_argument(
+        "--include-patch",
+        action="store_true",
+        help="include patch-level bumps (default: skip — usually noise)",
+    )
+    s_audit.add_argument(
+        "--packages",
+        help="comma-separated subset of dep names to audit",
+    )
+    s_audit.add_argument(
+        "--fetch-diffs",
+        action="store_true",
+        help="for each changed dep, also pull GH release notes (slow on monorepos)",
+    )
+    s_audit.add_argument(
+        "--json",
+        action="store_true",
+        help="emit structured output (changes[]) for CI consumption",
+    )
+    s_audit.set_defaults(func=cmd_audit)
 
     args = p.parse_args()
     return args.func(args)
