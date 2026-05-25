@@ -225,11 +225,24 @@ def cmd_page(args: argparse.Namespace) -> int:
 
 # ── diff subcommand ───────────────────────────────────────────────
 
-_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+]([^\s]*))?$")
+# Matches three real-world tag conventions:
+#   - "v6.0.191"             single-package repo, `v` prefix
+#   - "6.0.191"              single-package repo, bare semver
+#   - "ai@6.0.191"           Changesets monorepo (vercel/ai, tanstack/query)
+#   - "@ai-sdk/anthropic@3.0.79"  scoped monorepo package
+# The optional non-capturing prefix `(?:[^@\s]+@)?` swallows everything up to
+# the LAST `@` before the version, so scoped scope-and-package both work.
+_SEMVER_RE = re.compile(
+    r"^(?:[^@\s]+@)?v?(\d+)\.(\d+)\.(\d+)(?:[-+]([^\s]*))?$"
+)
 
 
 def parse_semver(s: str) -> tuple[int, int, int, tuple[str, ...]] | None:
-    """Comparable tuple from a semver string, or None on bad input."""
+    """Comparable tuple from a semver string, or None on bad input.
+
+    Accepts both single-package tags (`v1.2.3`, `1.2.3`) and Changesets-
+    monorepo tags (`pkg@1.2.3`, `@scope/pkg@1.2.3`).
+    """
     m = _SEMVER_RE.match(s.strip())
     if not m:
         return None
@@ -238,6 +251,20 @@ def parse_semver(s: str) -> tuple[int, int, int, tuple[str, ...]] | None:
     # (sorts late ASCII) as the tiebreaker for non-pre versions.
     pre_key: tuple[str, ...] = (pre,) if pre else ("~",)
     return (int(maj), int(minor), int(patch), pre_key)
+
+
+def tag_matches_library(tag: str, library: str) -> bool:
+    """
+    For monorepo tags like `ai@6.0.191` or `@ai-sdk/anthropic@3.0.79`,
+    confirm the tag is FOR our library. Single-package tags (`v6.0.191`,
+    `6.0.191`) always pass — they're unambiguous.
+    """
+    if "@" not in tag.lstrip("v").lstrip("@"):
+        return True  # `v6.0.191`, `6.0.191`, or `@scope/pkg` without a version
+    # tag has a `pkg@` prefix; check it matches `library`. Compare with both
+    # scope-stripped and full forms, since the user might pass either.
+    prefix = tag.rsplit("@", 1)[0]
+    return prefix == library or prefix.lstrip("@") == library.lstrip("@")
 
 
 _GITHUB_RE = re.compile(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?(?:/|$)")
@@ -280,30 +307,78 @@ def cmd_diff(args: argparse.Namespace) -> int:
     if from_v > to_v:
         from_v, to_v = to_v, from_v
 
+    # Two-stage fetch to handle huge monorepos:
+    #
+    # Stage 1: `gh release list` returns just tagName + publishedAt for the
+    #          most recent N releases. Cheap (~KB) and fast. We use --limit
+    #          5000 so even Changesets monorepos like vercel/ai (which fire
+    #          a release on every package, ~12MB total) stay manageable.
+    #
+    # Stage 2: for each tag actually in our version range AND matching this
+    #          library, fetch the body via `gh release view`. Tiny per call.
+    #
+    # The alternative (`gh api repos/<r>/releases --paginate`) buffers every
+    # release body — 12+ MB on big monorepos — and trips subprocess timeouts.
     raw = run(
-        ["gh", "api", f"repos/{owner_repo}/releases", "--paginate"],
+        [
+            "gh",
+            "release",
+            "list",
+            "--repo",
+            owner_repo,
+            "--limit",
+            "5000",
+            "--json",
+            "tagName,publishedAt",
+        ],
         timeout=60,
     )
     if not raw:
         print(
-            f"fresh-docs: `gh api` returned nothing for {owner_repo}. "
+            f"fresh-docs: `gh release list` returned nothing for {owner_repo}. "
             "Is `gh` authenticated? Try `gh auth status`.",
             file=sys.stderr,
         )
         return 3
 
     try:
-        releases = json.loads(raw)
+        tag_meta = json.loads(raw)
     except json.JSONDecodeError as e:
         print(f"fresh-docs: couldn't parse gh output: {e}", file=sys.stderr)
         return 3
 
-    in_range: list[tuple[tuple, str, str]] = []
-    for r in releases:
-        tag = r.get("tag_name") or ""
+    # Filter to in-range, library-matching tags first (cheap).
+    matching_tags: list[tuple[tuple, str]] = []
+    for t in tag_meta:
+        tag = t.get("tagName") or ""
         ver = parse_semver(tag)
-        if ver and from_v <= ver <= to_v:
-            in_range.append((ver, tag, r.get("body") or ""))
+        if not ver or not (from_v <= ver <= to_v):
+            continue
+        if not tag_matches_library(tag, args.library):
+            continue
+        matching_tags.append((ver, tag))
+
+    if not matching_tags:
+        # Fall back to single-tag fetch in case the tag uses an unusual prefix
+        # the filter didn't recognize. This lets a user manually pass exact
+        # tags like `ai@6.0.191` and get something useful back.
+        print(
+            f"fresh-docs: no tags in {owner_repo} match {args.library} between "
+            f"{args.from_version} and {args.to_version} (scanned {len(tag_meta)} "
+            "releases). If this is a monorepo, check the tag format with "
+            f"`gh release list --repo {owner_repo} --limit 5`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Now fetch the body for each in-range tag.
+    in_range: list[tuple[tuple, str, str]] = []
+    for ver, tag in matching_tags:
+        body = run(
+            ["gh", "release", "view", tag, "--repo", owner_repo, "--json", "body", "--jq", ".body"],
+            timeout=15,
+        )
+        in_range.append((ver, tag, body or ""))
 
     if not in_range:
         print(
