@@ -9,23 +9,22 @@ fresh-docs — pull authoritative, version-current library docs.
 Single-file CLI, stdlib-only. The PEP 723 metadata block above lets `uv`
 launch this script directly via the shebang — no `pip install` needed.
 
-Install (two equivalent paths):
+Install:
   # Shebang + uv. Pin to a known-good revision in CI if you want stability.
   curl -fsSL https://raw.githubusercontent.com/vkumar04/fresh-docs/main/fresh-docs \
     -o ~/.local/bin/fresh-docs && chmod +x ~/.local/bin/fresh-docs
-
-  # OR install as a proper uv tool (drops `fresh-docs` on PATH):
-  uv tool install git+https://github.com/vkumar04/fresh-docs
 
 Subcommands:
   llms <library> [--grep <pat>]    raw llms.txt fetch (no LLM pre-summary)
   page <url>                       browser-UA HTTP GET + HTML strip
   diff <library> <from> <to>       GH release notes between two semver tags
+  audit [--since <ref>]            package.json bump report since a commit
+  check-map                        HEAD-check every URL in LLMS_URL_MAP
 
 Exit codes:
   0   success
-  1   bad input / unresolved library
-  2   HTTP non-200 from upstream
+  1   bad input / unresolved library / breaking bumps found (--flag-breaking-only)
+  2   HTTP non-200 from upstream / dead map entries (check-map)
   3   subprocess failed (npm / gh)
 """
 
@@ -33,11 +32,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 UA = "Mozilla/5.0 (compatible; fresh-docs/1.0)"
@@ -68,11 +69,23 @@ LLMS_URL_MAP: dict[str, str] = {
     # Python ecosystem (so `uv view` style lookups can't poison this)
     "uv": "https://docs.astral.sh/uv/llms.txt",
     "ruff": "https://docs.astral.sh/ruff/llms.txt",
+    # Elixir ecosystem — recent ExDoc emits llms.txt on HexDocs, so most
+    # packages get one for free (usually index-format: drill in with
+    # --subpage). Content-verified 2026-07-08: hexdocs.pm serves an HTML
+    # fallback page with a 200 for missing files, so a status check alone
+    # lies. phoenix and oban have NO real llms.txt as of 2026-07-08 — use
+    # `fresh-docs page https://hexdocs.pm/<pkg>/<page>.html` for those.
+    "elixir": "https://hexdocs.pm/elixir/llms.txt",
+    "ecto": "https://hexdocs.pm/ecto/llms.txt",
+    "ash": "https://hexdocs.pm/ash/llms.txt",
+    "phoenix_live_view": "https://hexdocs.pm/phoenix_live_view/llms.txt",
 }
 
 # When llms.txt is the "index" format (a list of `[title](url.md)` links
 # pointing at clean-markdown subpages), pass --subpage <regex> to drill in.
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+\.md)\)")
+# Links may be absolute (uv, Vercel) or relative (HexDocs: `bindings.md`) —
+# relative ones get resolved against the llms.txt URL at fetch time.
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+\.md)\)")
 
 
 def http_get(url: str) -> str:
@@ -88,14 +101,90 @@ def http_get(url: str) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def run(argv: list[str], timeout: int = 15) -> str:
-    """Run a subprocess, return stdout. Empty string on failure (caller decides)."""
+def run(argv: list[str], timeout: int = 15) -> tuple[str, str]:
+    """Run a subprocess, return (stdout, stderr). stdout is "" on failure,
+    and stderr carries the diagnostic so callers can surface real errors
+    ("gh: Not logged in") instead of guessing."""
     try:
-        return subprocess.check_output(
-            argv, text=True, stderr=subprocess.DEVNULL, timeout=timeout
-        ).strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
+        proc = subprocess.run(
+            argv, text=True, capture_output=True, timeout=timeout, check=False
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return "", str(e)
+    if proc.returncode != 0:
+        return "", (proc.stderr or "").strip()
+    return proc.stdout.strip(), (proc.stderr or "").strip()
+
+
+def npm_view(package: str, field: str) -> str:
+    """`npm view <pkg> <field>`, trying npm directly before `bunx npm` so a
+    machine with only one of the two launchers still resolves."""
+    for argv in (
+        ["npm", "view", package, field],
+        ["bunx", "npm", "view", package, field],
+    ):
+        out, _ = run(argv)
+        if out:
+            return out
+    return ""
+
+
+def _pypi_urls(package: str) -> list[str]:
+    """Candidate docs/homepage/repo URLs from the PyPI JSON API ([] on any
+    failure). Lets `llms`/`diff` resolve Python packages, not just npm ones."""
+    try:
+        raw = http_get(f"https://pypi.org/pypi/{package}/json")
+        info = json.loads(raw).get("info") or {}
+    except (OSError, ValueError):
+        return []
+    links = info.get("project_urls") or {}
+    # Documentation-style links first — that's where llms.txt lives.
+    urls = [v for k, v in links.items() if "doc" in k.lower()]
+    urls.append(info.get("home_page"))
+    urls += [v for k, v in links.items() if "doc" not in k.lower()]
+    return [u for u in urls if u]
+
+
+def _hex_urls(package: str) -> list[str]:
+    """Candidate docs/repo URLs from the hex.pm API ([] on any failure) —
+    Elixir/Erlang packages resolve through Hex + HexDocs, not npm/PyPI."""
+    try:
+        raw = http_get(f"https://hex.pm/api/packages/{package}")
+        pkg = json.loads(raw)
+    except (OSError, ValueError):
+        return []
+    # docs_html_url may be a custom subdomain (phoenix.hexdocs.pm); the
+    # canonical hexdocs.pm/<pkg> path usually works too, so try both.
+    urls = [pkg.get("docs_html_url"), f"https://hexdocs.pm/{package}"]
+    urls += list(((pkg.get("meta") or {}).get("links") or {}).values())
+    return [u for u in urls if u]
+
+
+def _looks_like_html(text: str) -> bool:
+    return text.lstrip()[:15].lower().startswith(("<!doctype", "<html"))
+
+
+def _url_alive(url: str) -> bool:
+    """HEAD-check with GET fallback for servers that reject or hang on HEAD.
+    A 2xx with a text/html content-type counts as DEAD: hexdocs.pm serves an
+    HTML fallback page with status 200 for missing llms.txt files."""
+    for method in ("HEAD", "GET"):
+        try:
+            req = Request(url, headers={"User-Agent": UA}, method=method)
+            with urlopen(req, timeout=TIMEOUT_S) as resp:
+                if not 200 <= resp.status < 400:
+                    return False
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                return "text/html" not in ctype
+        except HTTPError as e:
+            if method == "HEAD" and e.code in (403, 405):
+                continue
+            return False
+        except OSError:
+            if method == "HEAD":
+                continue
+            return False
+    return False
 
 
 # ── llms subcommand ────────────────────────────────────────────────
@@ -103,22 +192,31 @@ def run(argv: list[str], timeout: int = 15) -> str:
 
 def _autodiscover_llms_url(library: str) -> str | None:
     """
-    Conservative auto-discovery via `npm view <lib> homepage`.
+    Conservative auto-discovery via `npm view <lib> homepage`, then PyPI
+    project URLs, then hex.pm (Elixir).
 
-    Defensive: dogfooding revealed that `npm view uv homepage` returns a
-    homepage for `github.com/micnic/uv` (a random JS package), which is
-    NOT the tool the user meant. Refuse the result if the homepage host
-    doesn't somehow reference the library name — otherwise return None
-    and let the user supply a URL via `page <url>` instead.
+    Defensive twice over: dogfooding revealed that `npm view uv homepage`
+    returns a homepage for `github.com/micnic/uv` (a random JS package),
+    which is NOT the tool the user meant — so a candidate URL must
+    reference the library name. And a name-collided candidate (npm's
+    `ecto` vs Elixir's) usually has no llms.txt, so each candidate is
+    liveness-checked and the first one actually serving llms.txt wins.
     """
-    homepage = run(["bunx", "npm", "view", library, "homepage"])
-    if not homepage:
-        return None
     # Library name must appear somewhere in the URL host or path. Scoped
     # packages like @tanstack/react-query → strip the leading "@<scope>/".
     bare = library.split("/")[-1].lower()
-    if bare in homepage.lower():
-        return homepage.rstrip("/") + "/llms.txt"
+    candidates: list[str] = []
+    homepage = npm_view(library, "homepage")
+    if homepage:
+        candidates.append(homepage)
+    candidates += _pypi_urls(library)
+    candidates += _hex_urls(library)
+    for cand in candidates:
+        if bare not in cand.lower():
+            continue
+        url = cand.rstrip("/") + "/llms.txt"
+        if _url_alive(url):
+            return url
     return None
 
 
@@ -127,8 +225,7 @@ def cmd_llms(args: argparse.Namespace) -> int:
     if not url:
         print(
             f"fresh-docs: no llms.txt URL for '{args.library}' "
-            "(not in map, npm has no matching homepage, or homepage doesn't "
-            f"reference '{args.library}'). "
+            "(not in map, and no npm/PyPI/Hex homepage serving llms.txt). "
             "Add it to LLMS_URL_MAP or try `fresh-docs page <docs-url>`.",
             file=sys.stderr,
         )
@@ -139,7 +236,7 @@ def cmd_llms(args: argparse.Namespace) -> int:
     except HTTPError as e:
         print(f"fresh-docs: HTTP {e.code} from {url}", file=sys.stderr)
         return 2
-    except URLError as e:
+    except OSError as e:
         print(f"fresh-docs: network error fetching {url}: {e}", file=sys.stderr)
         return 2
 
@@ -148,13 +245,14 @@ def cmd_llms(args: argparse.Namespace) -> int:
     # llms.txt is an index of `[Title](https://.../index.md)` links.
     if args.subpage:
         sub_re = re.compile(args.subpage, re.IGNORECASE)
-        for label, suburl in _MD_LINK_RE.findall(content):
-            if sub_re.search(label) or sub_re.search(suburl):
+        for label, link in _MD_LINK_RE.findall(content):
+            if sub_re.search(label) or sub_re.search(link):
+                suburl = urljoin(url, link)
                 try:
                     content = http_get(suburl)
                     url = suburl
                     break
-                except (HTTPError, URLError) as e:
+                except OSError as e:
                     print(
                         f"fresh-docs: subpage fetch failed for {suburl}: {e}",
                         file=sys.stderr,
@@ -166,6 +264,15 @@ def cmd_llms(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+
+    if _looks_like_html(content):
+        print(
+            f"fresh-docs: {url} returned an HTML page, not text/markdown "
+            "(some hosts, e.g. hexdocs.pm, serve a 200 fallback page for "
+            "missing files). Try `fresh-docs page <docs-url>` instead.",
+            file=sys.stderr,
+        )
+        return 2
 
     if not args.grep:
         print(content)
@@ -188,7 +295,14 @@ def cmd_llms(args: argparse.Namespace) -> int:
             blocks.extend(lines[lo:hi])
             last_hi = hi - 1
     if not any_match:
-        print(f"fresh-docs: no match for /{args.grep}/i in {url}", file=sys.stderr)
+        hint = ""
+        if not args.subpage and _MD_LINK_RE.search(content):
+            hint = (
+                " — this llms.txt looks like an index of subpage links; "
+                f"try `--subpage '{args.grep}'` or `--subpage <page-name>` "
+                "to drill in first"
+            )
+        print(f"fresh-docs: no match for /{args.grep}/i in {url}{hint}", file=sys.stderr)
         return 1
     print(f"# matches for /{args.grep}/i in {url}\n")
     print("\n".join(blocks))
@@ -211,7 +325,7 @@ def cmd_page(args: argparse.Namespace) -> int:
     except HTTPError as e:
         print(f"fresh-docs: HTTP {e.code} from {args.url}", file=sys.stderr)
         return 2
-    except URLError as e:
+    except OSError as e:
         print(f"fresh-docs: network error fetching {args.url}: {e}", file=sys.stderr)
         return 2
 
@@ -231,10 +345,11 @@ def cmd_page(args: argparse.Namespace) -> int:
 #   - "6.0.191"              single-package repo, bare semver
 #   - "ai@6.0.191"           Changesets monorepo (vercel/ai, tanstack/query)
 #   - "@ai-sdk/anthropic@3.0.79"  scoped monorepo package
-# The optional non-capturing prefix `(?:[^@\s]+@)?` swallows everything up to
-# the LAST `@` before the version, so scoped scope-and-package both work.
+# The optional non-capturing prefix `(?:\S+@)?` is greedy, so it swallows
+# everything up to the LAST `@` before the version — both `pkg@1.2.3` and
+# `@scope/pkg@1.2.3` work. Build metadata (`+sha`) is ignored per semver.
 _SEMVER_RE = re.compile(
-    r"^(?:[^@\s]+@)?v?(\d+)\.(\d+)\.(\d+)(?:[-+]([^\s]*))?$"
+    r"^(?:\S+@)?v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+\S*)?$"
 )
 
 
@@ -271,23 +386,52 @@ def tag_matches_library(tag: str, library: str) -> bool:
 _GITHUB_RE = re.compile(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?(?:/|$)")
 
 
-def resolve_github_repo(library: str) -> str | None:
-    """Resolve <owner>/<repo> via `npm view <lib> repository.url`."""
-    url = run(["bunx", "npm", "view", library, "repository.url"])
-    if not url:
-        return None
-    m = _GITHUB_RE.search(url)
-    return m.group(1) if m else None
+def resolve_github_repo(library: str, ecosystem: str = "auto") -> str | None:
+    """Resolve <owner>/<repo> from a package registry. `auto` tries npm,
+    then PyPI, then hex.pm; pass an explicit ecosystem when the name is
+    claimed in several registries (npm's `ecto` vs Elixir's `ecto`)."""
+    if ecosystem in ("auto", "npm"):
+        url = npm_view(library, "repository.url")
+        m = _GITHUB_RE.search(url) if url else None
+        if m:
+            return m.group(1)
+    for eco, source in (("pypi", _pypi_urls), ("hex", _hex_urls)):
+        if ecosystem not in ("auto", eco):
+            continue
+        for cand in source(library):
+            m = _GITHUB_RE.search(cand)
+            if m:
+                return m.group(1)
+    return None
 
 
+# "Breaking …" headings in any casing/emoji decoration, PLUS Changesets-style
+# "### Major Changes" — Changesets repos (vercel/ai, TanStack) never write a
+# literal "Breaking" heading; their breaking changes land under "Major Changes".
 _BREAKING_BLOCK_RE = re.compile(
-    r"(?m)^(#{1,4})\s*[^\w\n]*\b(?:breaking)\b[\s\S]*?(?=^#{1,4}\s|\Z)",
+    r"(?m)^(#{1,4})\s*[^\w\n]*\b(?:breaking|major changes)\b[\s\S]*?(?=^#{1,4}\s|\Z)",
     re.IGNORECASE,
 )
 
 
+def _changelog_at_tag(owner_repo: str, version: str) -> dict | None:
+    """Raw CHANGELOG.md at the version tag (trying `v1.2.3` then `1.2.3`).
+    The fallback for repos that tag versions but never publish GitHub
+    releases — common in Elixir (ecto's last GH release is v3.4.5)."""
+    for tag in (f"v{version}", version):
+        url = f"https://raw.githubusercontent.com/{owner_repo}/{tag}/CHANGELOG.md"
+        try:
+            content = http_get(url)
+        except OSError:
+            continue
+        if content.strip() and not _looks_like_html(content):
+            # Changelogs are newest-first; the head covers the recent bumps.
+            return {"url": url, "content": "\n".join(content.splitlines()[:200])}
+    return None
+
+
 def _do_diff(
-    library: str, from_version: str, to_version: str
+    library: str, from_version: str, to_version: str, ecosystem: str = "auto"
 ) -> tuple[int, dict]:
     """
     Shared core of cmd_diff. Returns (exit_code, result_dict).
@@ -300,13 +444,15 @@ def _do_diff(
         "to": to_version,
         "repo": None,
         "releases": [],
+        "changelog_fallback": None,
         "error": None,
     }
 
-    owner_repo = resolve_github_repo(library)
+    owner_repo = resolve_github_repo(library, ecosystem)
     if not owner_repo:
         result["error"] = (
-            f"couldn't resolve '{library}' to a GitHub repo via npm"
+            f"couldn't resolve '{library}' to a GitHub repo "
+            f"(ecosystem: {ecosystem})"
         )
         return 1, result
     result["repo"] = owner_repo
@@ -323,7 +469,7 @@ def _do_diff(
         from_version, to_version = to_version, from_version
         result["from"], result["to"] = from_version, to_version
 
-    raw = run(
+    raw, err = run(
         [
             "gh", "release", "list",
             "--repo", owner_repo,
@@ -333,9 +479,9 @@ def _do_diff(
         timeout=60,
     )
     if not raw:
+        detail = f"gh stderr: {err[:200]}" if err else "is `gh` installed and authenticated?"
         result["error"] = (
-            f"`gh release list` returned nothing for {owner_repo} "
-            "(is `gh` authenticated?)"
+            f"`gh release list` returned nothing for {owner_repo} ({detail})"
         )
         return 3, result
 
@@ -345,17 +491,50 @@ def _do_diff(
         result["error"] = f"couldn't parse gh output: {e}"
         return 3, result
 
+    # Range is (from, to] — exclusive of `from`. The from-version is what's
+    # already installed; its own release notes describe the PREVIOUS upgrade
+    # and would false-flag e.g. a 6.0.0 → 6.0.1 patch bump as breaking.
     matching_tags: list[tuple[tuple, str]] = []
     for t in tag_meta:
         tag = t.get("tagName") or ""
         ver = parse_semver(tag)
-        if not ver or not (from_v <= ver <= to_v):
+        if not ver or not (from_v < ver <= to_v):
             continue
         if not tag_matches_library(tag, library):
             continue
         matching_tags.append((ver, tag))
 
+    # `gh release list` windows to the most recent 5000 releases. A busy
+    # Changesets monorepo (vercel/ai ships ~40 packages) blows past that in
+    # months, silently hiding older tags — ai@6.0.0 was already outside the
+    # window while ai@7.x shipped. Backfill ALL of this package's tags via
+    # the refs API, prefix-filtered so the response stays small.
+    if len(tag_meta) >= 4999:
+        refs, _ = run(
+            [
+                "gh", "api", "--paginate",
+                f"repos/{owner_repo}/git/matching-refs/tags/{library}@",
+                "--jq", ".[].ref",
+            ],
+            timeout=120,
+        )
+        seen_tags = {tag for _, tag in matching_tags}
+        for ref in refs.splitlines():
+            tag = ref.removeprefix("refs/tags/")
+            if tag in seen_tags:
+                continue
+            ver = parse_semver(tag)
+            if not ver or not (from_v < ver <= to_v):
+                continue
+            if not tag_matches_library(tag, library):
+                continue
+            matching_tags.append((ver, tag))
+
     if not matching_tags:
+        fallback = _changelog_at_tag(owner_repo, to_version)
+        if fallback:
+            result["changelog_fallback"] = fallback
+            return 0, result
         result["error"] = (
             f"no tags in {owner_repo} match {library} between "
             f"{from_version} and {to_version} (scanned {len(tag_meta)} releases)"
@@ -363,11 +542,21 @@ def _do_diff(
         return 1, result
 
     matching_tags.sort()
-    for ver, tag in matching_tags:
-        body = run(
+
+    def _release_body(tag: str) -> str:
+        body, _ = run(
             ["gh", "release", "view", tag, "--repo", owner_repo, "--json", "body", "--jq", ".body"],
             timeout=15,
         )
+        return body
+
+    # A major-version range can span dozens of releases; fetch bodies in
+    # parallel. 4 workers here (not 8): `audit --fetch-diffs` already runs
+    # 8 _do_diff calls concurrently, so worst-case `gh` processes stay ≤ 32.
+    with ThreadPoolExecutor(max_workers=min(4, len(matching_tags))) as ex:
+        bodies = list(ex.map(_release_body, [tag for _, tag in matching_tags]))
+
+    for (ver, tag), body in zip(matching_tags, bodies):
         breaking_blocks = [m.group(0).strip() for m in _BREAKING_BLOCK_RE.finditer(body or "")]
         version_str = ".".join(str(x) for x in ver[:3])
         if ver[3] != ("~",):
@@ -382,7 +571,9 @@ def _do_diff(
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
-    code, result = _do_diff(args.library, args.from_version, args.to_version)
+    code, result = _do_diff(
+        args.library, args.from_version, args.to_version, args.ecosystem
+    )
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -391,6 +582,16 @@ def cmd_diff(args: argparse.Namespace) -> int:
     if result["error"]:
         print(f"fresh-docs: {result['error']}", file=sys.stderr)
         return code
+
+    if result["changelog_fallback"]:
+        fb = result["changelog_fallback"]
+        print(
+            f"# {result['library']}: {result['from']} → {result['to']} — "
+            f"no GitHub releases in range for {result['repo']}; "
+            f"CHANGELOG at the {result['to']} tag instead:\n#   {fb['url']}\n"
+        )
+        print(fb["content"])
+        return 0
 
     releases = result["releases"]
     plural = "s" if len(releases) != 1 else ""
@@ -416,22 +617,23 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 def _read_package_json(path_or_ref: str) -> dict | None:
     """
-    Read package.json from disk OR from a git ref (e.g. "HEAD~1").
+    Read package.json from a file path, or from ANY git ref (branch, tag,
+    HEAD^, HEAD~n, sha, origin/main, …) via `git show <ref>:package.json`.
+    Existing files win the ambiguity; everything else is handed to git.
     Returns parsed JSON, or None on failure.
     """
-    if path_or_ref in ("HEAD", "main") or path_or_ref.startswith("HEAD~") \
-       or re.match(r"^[0-9a-f]{4,}$", path_or_ref):
-        raw = run(["git", "show", f"{path_or_ref}:package.json"], timeout=10)
-        if not raw:
-            return None
+    if os.path.isfile(path_or_ref):
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            with open(path_or_ref) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
             return None
+    raw, _ = run(["git", "show", f"{path_or_ref}:package.json"], timeout=10)
+    if not raw:
+        return None
     try:
-        with open(path_or_ref) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+        return json.loads(raw)
+    except json.JSONDecodeError:
         return None
 
 
@@ -464,19 +666,27 @@ def cmd_audit(args: argparse.Namespace) -> int:
     if args.since:
         prev_ref = args.since
     else:
-        log = run(
+        dirty, _ = run(
+            ["git", "status", "--porcelain", "--", "package.json"], timeout=10
+        )
+        log, _ = run(
             ["git", "log", "--format=%H", "-n", "5", "--", "package.json"],
             timeout=10,
         )
         commits = [c for c in log.splitlines() if c]
-        if len(commits) < 2:
+        # Dirty working tree = the just-ran-`ncu -u`-and-haven't-committed
+        # case: diff disk against the LAST commit. Clean tree = the bump is
+        # already committed: diff against the commit BEFORE it ("what did
+        # the last bump change?").
+        needed = 1 if dirty else 2
+        if len(commits) < needed:
             print(
                 "fresh-docs: no prior package.json revision to diff against. "
                 "Pass --since <ref> explicitly.",
                 file=sys.stderr,
             )
             return 1
-        prev_ref = commits[1]
+        prev_ref = commits[0] if dirty else commits[1]
 
     current = _read_package_json("package.json")
     if not current:
@@ -500,8 +710,21 @@ def cmd_audit(args: argparse.Namespace) -> int:
     prev_deps = _all_deps(previous)
 
     package_filter = (
-        set(args.packages.split(",")) if args.packages else None
+        {p.strip() for p in args.packages.split(",") if p.strip()}
+        if args.packages
+        else None
     )
+
+    added = {
+        n: _strip_semver_prefix(v)
+        for n, v in sorted(cur_deps.items())
+        if n not in prev_deps and (not package_filter or n in package_filter)
+    }
+    removed = {
+        n: _strip_semver_prefix(v)
+        for n, v in sorted(prev_deps.items())
+        if n not in cur_deps and (not package_filter or n in package_filter)
+    }
 
     # --flag-breaking-only implicitly turns on include-patch + fetch-diffs:
     # we have to fetch every dep's release notes (including patches) to
@@ -540,7 +763,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
         worker_count = min(8, len(changes))
         with ThreadPoolExecutor(max_workers=worker_count) as ex:
             futures = {
-                ex.submit(_do_diff, c["library"], c["from"], c["to"]): c
+                # package.json deps are npm by definition — skip PyPI/hex.
+                ex.submit(_do_diff, c["library"], c["from"], c["to"], "npm"): c
                 for c in changes
             }
             for future in as_completed(futures):
@@ -576,38 +800,46 @@ def cmd_audit(args: argparse.Namespace) -> int:
         "include_patch": bool(args.include_patch),
         "flag_breaking_only": bool(args.flag_breaking_only),
         "package_filter": sorted(package_filter) if package_filter else None,
+        "added": added,
+        "removed": removed,
         "changes": changes,
     }
 
+    # CI-gate contract: --flag-breaking-only exits 1 when anything survives
+    # the breaking filter, so pipelines can gate on exit code alone.
+    exit_code = 1 if (args.flag_breaking_only and changes) else 0
+
     if args.json:
         print(json.dumps(report, indent=2))
+        return exit_code
+
+    if args.flag_breaking_only and not changes:
+        print(
+            f"fresh-docs audit: no releases with breaking-change blocks "
+            f"between {prev_ref[:8]} and HEAD across "
+            f"{len(cur_deps)} dependencies. All clear."
+        )
+        return 0
+    if not changes and not added and not removed:
+        kind = "non-patch changes" if not args.include_patch else "changes"
+        print(
+            f"fresh-docs audit: no {kind} between {prev_ref[:8]} and HEAD"
+            + (" (within --packages filter)" if package_filter else "")
+        )
         return 0
 
-    if not changes:
-        if args.flag_breaking_only:
-            print(
-                f"fresh-docs audit: no releases with breaking-change blocks "
-                f"between {prev_ref[:8]} and HEAD across "
-                f"{sum(1 for _ in cur_deps)} dependencies. All clear."
-            )
-        else:
-            kind = "non-patch changes" if not args.include_patch else "changes"
-            print(
-                f"fresh-docs audit: no {kind} between {prev_ref[:8]} and HEAD"
-                + (" (within --packages filter)" if package_filter else "")
-            )
-        return 0
-
+    total = len(changes) + len(added) + len(removed)
     print(
-        f"# fresh-docs audit: {len(changes)} change"
-        f"{'s' if len(changes) != 1 else ''} "
+        f"# fresh-docs audit: {total} change"
+        f"{'s' if total != 1 else ''} "
         f"from {prev_ref[:8]} → HEAD\n"
     )
     bump_counts: dict[str, int] = {}
     for c in changes:
         bump_counts[c["bump_type"]] = bump_counts.get(c["bump_type"], 0) + 1
-    summary = ", ".join(f"{n} {k}" for k, n in sorted(bump_counts.items()))
-    print(f"## Summary: {summary}\n")
+    if bump_counts:
+        summary = ", ".join(f"{n} {k}" for k, n in sorted(bump_counts.items()))
+        print(f"## Summary: {summary}\n")
 
     by_bump: dict[str, list[dict]] = {"major": [], "minor": [], "patch": [], "unknown": []}
     for c in changes:
@@ -632,7 +864,62 @@ def cmd_audit(args: argparse.Namespace) -> int:
                 line += f"  (diff unavailable: {c['diff']['error'][:60]}…)"
             print(line)
         print()
-    return 0
+    if added and not args.flag_breaking_only:
+        print(f"## Added ({len(added)})")
+        for name, ver in added.items():
+            print(f"  - {name}@{ver}")
+        print()
+    if removed and not args.flag_breaking_only:
+        print(f"## Removed ({len(removed)})")
+        for name, ver in removed.items():
+            print(f"  - {name}@{ver}")
+        print()
+    return exit_code
+
+
+# ── check-map subcommand ──────────────────────────────────────────
+
+
+def cmd_check_map(args: argparse.Namespace) -> int:
+    """HEAD-check every URL in LLMS_URL_MAP so stale entries get caught
+    before a user does. Exits 2 if any entry is dead."""
+    url_to_libs: dict[str, list[str]] = {}
+    for lib, url in sorted(LLMS_URL_MAP.items()):
+        url_to_libs.setdefault(url, []).append(lib)
+
+    def _status(url: str) -> tuple[str, int | str, bool]:
+        def _fetch(method: str) -> tuple[int, bool]:
+            req = Request(url, headers={"User-Agent": UA}, method=method)
+            with urlopen(req, timeout=TIMEOUT_S) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                return resp.status, "text/html" in ctype
+        try:
+            return (url, *_fetch("HEAD"))
+        except HTTPError as e:
+            if e.code not in (403, 405):  # 403/405: CDN rejects HEAD, retry GET
+                return url, e.code, False
+        except OSError:
+            pass  # some servers hang on HEAD entirely (vercel.com); retry GET
+        try:
+            return (url, *_fetch("GET"))
+        except HTTPError as e:
+            return url, e.code, False
+        except OSError as e:
+            return url, f"network error: {e}", False
+
+    all_ok = True
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for url, status, is_html in ex.map(_status, url_to_libs):
+            ok = isinstance(status, int) and 200 <= status < 400 and not is_html
+            all_ok = all_ok and ok
+            mark = " ok " if ok else "DEAD"
+            # A 200 that's text/html is a fallback page, not a real llms.txt
+            # (hexdocs.pm does this) — flag it so the map entry gets pruned.
+            note = "  [200 but text/html — fallback page?]" if (
+                is_html and isinstance(status, int) and 200 <= status < 400
+            ) else ""
+            print(f"{mark}  {status}  {url}  ({', '.join(url_to_libs[url])}){note}")
+    return 0 if all_ok else 2
 
 
 # ── argparse ──────────────────────────────────────────────────────
@@ -664,13 +951,23 @@ def main() -> int:
     s_diff = sub.add_parser(
         "diff", help="release notes between two semver tags (breaking-change-aware)"
     )
-    s_diff.add_argument("library", help="npm package name")
+    s_diff.add_argument("library", help="package name (npm, PyPI, or Hex)")
     s_diff.add_argument("from_version", metavar="from", help="e.g. 11.14.0")
     s_diff.add_argument("to_version", metavar="to", help="e.g. 12.0.0")
     s_diff.add_argument(
         "--json",
         action="store_true",
         help="emit structured output (releases, breaking_blocks) for CI / audit consumers",
+    )
+    s_diff.add_argument(
+        "--ecosystem",
+        choices=("auto", "npm", "pypi", "hex"),
+        default="auto",
+        help=(
+            "registry to resolve the package's GitHub repo through "
+            "(default: auto = npm → PyPI → hex.pm; pass explicitly when the "
+            "name is claimed in several registries, e.g. `ecto`)"
+        ),
     )
     s_diff.set_defaults(func=cmd_diff)
 
@@ -683,7 +980,11 @@ def main() -> int:
     )
     s_audit.add_argument(
         "--since",
-        help="git ref to diff against (default: second-most-recent commit touching package.json)",
+        help=(
+            "git ref to diff against — any branch, tag, HEAD^/HEAD~n, or sha "
+            "(default: last commit touching package.json if the working tree "
+            "is dirty, else the commit before it)"
+        ),
     )
     s_audit.add_argument(
         "--include-patch",
@@ -704,8 +1005,9 @@ def main() -> int:
         action="store_true",
         help=(
             "scan ALL bumps (incl. patch) and report only those whose release "
-            "notes contain a `## Breaking` block — catches the rare safety-"
-            "relevant patch. Implies --include-patch + --fetch-diffs."
+            "notes contain a `Breaking`/`Major Changes` block — catches the "
+            "rare safety-relevant patch. Implies --include-patch + "
+            "--fetch-diffs. Exits 1 when any such bump is found (CI gate)."
         ),
     )
     s_audit.add_argument(
@@ -714,6 +1016,12 @@ def main() -> int:
         help="emit structured output (changes[]) for CI consumption",
     )
     s_audit.set_defaults(func=cmd_audit)
+
+    s_check = sub.add_parser(
+        "check-map",
+        help="HEAD-check every URL in the built-in llms.txt map (exit 2 on dead entries)",
+    )
+    s_check.set_defaults(func=cmd_check_map)
 
     args = p.parse_args()
     return args.func(args)
