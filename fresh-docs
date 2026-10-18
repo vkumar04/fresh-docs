@@ -24,7 +24,8 @@ Subcommands:
 Exit codes:
   0   success
   1   bad input / unresolved library / breaking bumps found (--flag-breaking-only)
-  2   HTTP non-200 from upstream / dead map entries (check-map)
+  2   HTTP non-200 from upstream / dead map entries (check-map) /
+      deps whose notes couldn't be fetched (--flag-breaking-only)
   3   subprocess failed (npm / gh)
 """
 
@@ -116,12 +117,12 @@ def run(argv: list[str], timeout: int = 15) -> tuple[str, str]:
     return proc.stdout.strip(), (proc.stderr or "").strip()
 
 
-def npm_view(package: str, field: str) -> str:
-    """`npm view <pkg> <field>`, trying npm directly before `bunx npm` so a
+def npm_view(package: str, *fields: str) -> str:
+    """`npm view <pkg> <fields…>`, trying npm directly before `bunx npm` so a
     machine with only one of the two launchers still resolves."""
     for argv in (
-        ["npm", "view", package, field],
-        ["bunx", "npm", "view", package, field],
+        ["npm", "view", package, *fields],
+        ["bunx", "npm", "view", package, *fields],
     ):
         out, _ = run(argv)
         if out:
@@ -353,7 +354,10 @@ _SEMVER_RE = re.compile(
 )
 
 
-def parse_semver(s: str) -> tuple[int, int, int, tuple[str, ...]] | None:
+_RELEASE_KEY: tuple = (1,)
+
+
+def parse_semver(s: str) -> tuple[int, int, int, tuple] | None:
     """Comparable tuple from a semver string, or None on bad input.
 
     Accepts both single-package tags (`v1.2.3`, `1.2.3`) and Changesets-
@@ -363,10 +367,24 @@ def parse_semver(s: str) -> tuple[int, int, int, tuple[str, ...]] | None:
     if not m:
         return None
     maj, minor, patch, pre = m.groups()
-    # Pre-releases sort BEFORE releases at the same maj.min.patch. Use "~"
-    # (sorts late ASCII) as the tiebreaker for non-pre versions.
-    pre_key: tuple[str, ...] = (pre,) if pre else ("~",)
-    return (int(maj), int(minor), int(patch), pre_key)
+    # Pre-releases sort BEFORE releases at the same maj.min.patch (0 < 1).
+    # Per semver §11, numeric identifiers compare numerically and sort
+    # before alphanumeric ones, so `dev.10` > `dev.9`.
+    if not pre:
+        return (int(maj), int(minor), int(patch), _RELEASE_KEY)
+    ids = tuple(
+        (0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")
+    )
+    return (int(maj), int(minor), int(patch), (0, ids, pre))
+
+
+def is_prerelease(ver: tuple) -> bool:
+    return ver[3] != _RELEASE_KEY
+
+
+def format_semver(ver: tuple) -> str:
+    s = ".".join(str(x) for x in ver[:3])
+    return s + "-" + ver[3][2] if is_prerelease(ver) else s
 
 
 def tag_matches_library(tag: str, library: str) -> bool:
@@ -383,25 +401,77 @@ def tag_matches_library(tag: str, library: str) -> bool:
     return prefix == library or prefix.lstrip("@") == library.lstrip("@")
 
 
-_GITHUB_RE = re.compile(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?(?:/|$)")
+# Repo names may contain dots (vercel/next.js, socketio/socket.io); only a
+# trailing `.git` is stripped. An earlier `[^/.]+` silently rejected every
+# dotted repo, so `next` fell through to PyPI's unrelated `next` package.
+_GITHUB_RE = re.compile(
+    r"github\.com[:/]+([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[/#?]|$)"
+)
+_GITHUB_SHORTHAND_RE = re.compile(r"^(?:github:)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$")
 
 
-def resolve_github_repo(library: str, ecosystem: str = "auto") -> str | None:
-    """Resolve <owner>/<repo> from a package registry. `auto` tries npm,
-    then PyPI, then hex.pm; pass an explicit ecosystem when the name is
-    claimed in several registries (npm's `ecto` vs Elixir's `ecto`)."""
+def parse_github_url(url: str) -> str | None:
+    """`<owner>/<repo>` from any GitHub URL form npm/PyPI/Hex emit
+    (git+https, git+ssh, git@host:, github:owner/repo, bare owner/repo)."""
+    url = (url or "").strip()
+    m = _GITHUB_RE.search(url) or _GITHUB_SHORTHAND_RE.match(url)
+    if not m:
+        return None
+    owner, repo = m.groups()
+    repo = repo.removesuffix(".git")
+    if owner in (".", "..") or not repo or repo in (".", ".."):
+        return None
+    return f"{owner}/{repo}"
+
+
+def _npm_repository(library: str, version: str | None) -> tuple[str, str | None] | None:
+    """(repository url, monorepo directory) from npm, preferring the
+    metadata of the exact version being diffed: packages move repos
+    (prisma 7.10.0 → prisma/prisma, 7.10.1 → prisma/orm, latest →
+    prisma/prisma-cli), and `latest` can point somewhere with no tags for
+    the version you asked about."""
+    specs = [f"{library}@{version}", library] if version else [library]
+    for spec in specs:
+        raw = npm_view(spec, "repository", "--json")
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            data = data[-1] if data else None
+        if isinstance(data, str):
+            return data, None
+        if isinstance(data, dict) and data.get("url"):
+            return data["url"], data.get("directory")
+    return None
+
+
+def resolve_github_repo(
+    library: str, ecosystem: str = "auto", version: str | None = None
+) -> tuple[str, str | None, str] | None:
+    """Resolve (<owner>/<repo>, monorepo directory, registry) from a package registry.
+    `auto` tries npm, then PyPI, then hex.pm; pass an explicit ecosystem
+    when the name is claimed in several registries (npm's `ecto` vs
+    Elixir's `ecto`). If npm KNOWS the package, auto mode trusts it and does
+    not fall through — falling through is how a name collision on another
+    registry resolves to an unrelated repo."""
     if ecosystem in ("auto", "npm"):
-        url = npm_view(library, "repository.url")
-        m = _GITHUB_RE.search(url) if url else None
-        if m:
-            return m.group(1)
+        found = _npm_repository(library, version)
+        if found:
+            owner_repo = parse_github_url(found[0])
+            if owner_repo:
+                return owner_repo, found[1], "npm"
+            if ecosystem == "auto":
+                return None
     for eco, source in (("pypi", _pypi_urls), ("hex", _hex_urls)):
         if ecosystem not in ("auto", eco):
             continue
         for cand in source(library):
-            m = _GITHUB_RE.search(cand)
-            if m:
-                return m.group(1)
+            owner_repo = parse_github_url(cand) if "github" in cand else None
+            if owner_repo:
+                return owner_repo, None, eco
     return None
 
 
@@ -414,20 +484,174 @@ _BREAKING_BLOCK_RE = re.compile(
 )
 
 
-def _changelog_at_tag(owner_repo: str, version: str) -> dict | None:
-    """Raw CHANGELOG.md at the version tag (trying `v1.2.3` then `1.2.3`).
-    The fallback for repos that tag versions but never publish GitHub
-    releases — common in Elixir (ecto's last GH release is v3.4.5)."""
-    for tag in (f"v{version}", version):
-        url = f"https://raw.githubusercontent.com/{owner_repo}/{tag}/CHANGELOG.md"
-        try:
-            content = http_get(url)
-        except OSError:
+def breaking_blocks_in(text: str) -> list[str]:
+    return [m.group(0).strip() for m in _BREAKING_BLOCK_RE.finditer(text or "")]
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_HEADING_VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?![\w.])")
+
+
+def _heading_version(line: str) -> tuple[int, tuple] | None:
+    """(heading level, parsed semver) for a markdown heading that names a
+    version (`## 1.8.1`, `## [7.10.1] - 2026-10-12`, `# v3.13.0 (2026-…)`)."""
+    m = _HEADING_RE.match(line)
+    if not m:
+        return None
+    vm = _HEADING_VERSION_RE.search(m.group(2))
+    ver = parse_semver(vm.group(1)) if vm else None
+    return (len(m.group(1)), ver) if ver else None
+
+
+def slice_changelog(content: str, from_v: tuple, to_v: tuple) -> str | None:
+    """The CHANGELOG sections for versions in (from, to], or None when the
+    file has no heading for any version in that range. Changelogs on a
+    default branch also carry unreleased/newer entries; slicing keeps the
+    output pinned to the requested range even when the file isn't."""
+    lines = content.splitlines()
+    start = end = None
+    level = None
+    for i, line in enumerate(lines):
+        hv = _heading_version(line)
+        if not hv:
             continue
-        if content.strip() and not _looks_like_html(content):
-            # Changelogs are newest-first; the head covers the recent bumps.
-            return {"url": url, "content": "\n".join(content.splitlines()[:200])}
+        lvl, ver = hv
+        if start is None:
+            if from_v < ver <= to_v:
+                start, level = i, lvl
+        elif lvl <= level and ver <= from_v:
+            end = i
+            break
+    if start is None:
+        return None
+    return "\n".join(lines[start:end]).strip()
+
+
+def _changelog_candidates(directory: str | None) -> list[str]:
+    paths = []
+    if directory:
+        d = directory.strip("/")
+        paths += [f"{d}/CHANGELOG.md", f"{d}/CHANGES.md"]
+    return paths + ["CHANGELOG.md", "CHANGES.md", "HISTORY.md"]
+
+
+def _fetch_raw(owner_repo: str, ref: str, path: str) -> tuple[str, str] | None:
+    url = f"https://raw.githubusercontent.com/{owner_repo}/{ref}/{path}"
+    try:
+        content = http_get(url)
+    except OSError:
+        return None
+    if not content.strip() or _looks_like_html(content):
+        return None
+    return url, content
+
+
+def _changelog_fallback(
+    owner_repo: str,
+    to_tags: list[str],
+    directory: str | None,
+    from_v: tuple,
+    to_v: tuple,
+) -> dict | None:
+    """CHANGELOG for the range, trying the to-version tag first (pinned),
+    then the default branch — accepted there only when it has a heading
+    for a version in range, so a stale or unrelated file can't masquerade
+    as the answer. radix-ui publishes no releases or version tags at all;
+    its notes live only in packages/react/radix-ui/CHANGELOG.md on main."""
+    paths = _changelog_candidates(directory)
+    for ref, pinned in [(t, True) for t in to_tags] + [("HEAD", False)]:
+        for path in paths:
+            got = _fetch_raw(owner_repo, ref, path)
+            if not got:
+                continue
+            url, content = got
+            section = slice_changelog(content, from_v, to_v)
+            if section is None and not pinned:
+                continue
+            body = section if section is not None else "\n".join(content.splitlines()[:200])
+            return {
+                "url": url,
+                "ref": ref,
+                "pinned": pinned,
+                "sliced": section is not None,
+                "content": body,
+                "breaking_blocks": breaking_blocks_in(body),
+            }
     return None
+
+
+_DIRECT_LOOKUP_MAX = 25
+
+
+def no_release_notes_reason(library: str) -> str | None:
+    """Packages that publish no release notes anywhere, by design — a
+    lookup can only fail, and in --flag-breaking-only that failure would
+    fail every CI run of every project that has them."""
+    if library.startswith("@types/"):
+        return "DefinitelyTyped publishes no release notes for @types/* packages"
+    return None
+
+
+def npm_published_versions(library: str) -> list[str]:
+    raw = npm_view(library, "versions", "--json")
+    try:
+        data = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, str):
+        return [data]
+    return [v for v in data if isinstance(v, str)] if isinstance(data, list) else []
+
+
+def _tag_candidates(library: str, version: str) -> list[str]:
+    return [f"v{version}", version, f"{library}@{version}", f"{library}@v{version}"]
+
+
+def _existing_tags(owner_repo: str, library: str, version: str) -> list[str]:
+    """Tag names that actually exist for `version`, in candidate order."""
+    found = []
+    for tag in _tag_candidates(library, version):
+        out, _ = run(
+            ["gh", "api", f"repos/{owner_repo}/git/ref/tags/{tag}", "--jq", ".ref"],
+            timeout=15,
+        )
+        if out == f"refs/tags/{tag}":
+            found.append(tag)
+    return found
+
+
+_COMPARE_LIMIT = 100
+
+
+def _commits_fallback(owner_repo: str, base: str, head: str) -> dict | None:
+    """Commit subjects between two tags. Last resort for repos that tag a
+    version but publish neither a GitHub release nor a CHANGELOG
+    (prisma/orm 7.10.1)."""
+    raw, _ = run(
+        [
+            "gh", "api", f"repos/{owner_repo}/compare/{base}...{head}",
+            "--jq", "{total: .total_commits, subjects: [.commits[].commit.message | split(\"\\n\")[0]]}",
+        ],
+        timeout=30,
+    )
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    subjects = data.get("subjects") or []
+    return {
+        "url": f"https://github.com/{owner_repo}/compare/{base}...{head}",
+        "base": base,
+        "head": head,
+        "total_commits": data.get("total", len(subjects)),
+        "subjects": subjects[-_COMPARE_LIMIT:],
+        "breaking_blocks": [
+            s for s in subjects
+            if re.search(r"\bBREAKING\b|^\w+(\([^)]*\))?!:", s)
+        ],
+    }
 
 
 def _do_diff(
@@ -443,19 +667,14 @@ def _do_diff(
         "from": from_version,
         "to": to_version,
         "repo": None,
+        "directory": None,
         "releases": [],
         "changelog_fallback": None,
+        "commits_fallback": None,
+        "lookup": None,
+        "no_notes": None,
         "error": None,
     }
-
-    owner_repo = resolve_github_repo(library, ecosystem)
-    if not owner_repo:
-        result["error"] = (
-            f"couldn't resolve '{library}' to a GitHub repo "
-            f"(ecosystem: {ecosystem})"
-        )
-        return 1, result
-    result["repo"] = owner_repo
 
     from_v = parse_semver(from_version)
     to_v = parse_semver(to_version)
@@ -469,6 +688,72 @@ def _do_diff(
         from_version, to_version = to_version, from_version
         result["from"], result["to"] = from_version, to_version
 
+    no_notes = no_release_notes_reason(library)
+    if no_notes:
+        result["no_notes"] = no_notes
+        return 0, result
+
+    resolved = resolve_github_repo(library, ecosystem, to_version)
+    if not resolved:
+        result["error"] = (
+            f"couldn't resolve '{library}' to a GitHub repo "
+            f"(ecosystem: {ecosystem})"
+        )
+        return 1, result
+    owner_repo, directory, registry = resolved
+    result["repo"], result["directory"] = owner_repo, directory
+
+    # Pre-release tags only count when the user is diffing pre-releases.
+    # Otherwise 7.9.0 → 7.10.1 pulls in fifty `7.10.0-dev.N` releases.
+    want_pre = is_prerelease(from_v) or is_prerelease(to_v)
+    monorepo = bool(directory)
+
+    def _release_body(tag: str) -> str | None:
+        body, err = run(
+            ["gh", "release", "view", tag, "--repo", owner_repo, "--json", "body", "--jq", ".body"],
+            timeout=20,
+        )
+        if not body and err:
+            return None
+        return body
+
+    def _append(tag: str, ver: tuple, body: str) -> None:
+        result["releases"].append({
+            "tag": tag,
+            "version": format_semver(ver),
+            "body": body,
+            "breaking_blocks": breaking_blocks_in(body),
+        })
+
+    # Fast path: npm lists every published version, so a small range can be
+    # looked up release-by-release instead of listing up to 5000 releases
+    # (next.js ships canaries daily; listing took ~18s). Also immune to the
+    # release-list window. Large ranges fall through to the listing below.
+    published = npm_published_versions(library) if registry == "npm" else []
+    in_range = [
+        (ver, v) for v, ver in ((v, parse_semver(v)) for v in published)
+        if ver and from_v < ver <= to_v and (want_pre or not is_prerelease(ver))
+    ]
+    if published and 0 < len(in_range) <= _DIRECT_LOOKUP_MAX:
+        def _lookup(item: tuple) -> tuple | None:
+            ver, v = item
+            cands = _tag_candidates(library, v)
+            if monorepo:
+                cands = cands[2:] + cands[:2]
+            for tag in cands:
+                body = _release_body(tag)
+                if body is not None:
+                    return tag, ver, body
+            return None
+
+        with ThreadPoolExecutor(max_workers=min(4, len(in_range))) as ex:
+            hits = [h for h in ex.map(_lookup, sorted(in_range)) if h]
+        for tag, ver, body in hits:
+            _append(tag, ver, body)
+        if result["releases"]:
+            result["lookup"] = "direct"
+            return 0, result
+
     raw, err = run(
         [
             "gh", "release", "list",
@@ -476,7 +761,7 @@ def _do_diff(
             "--limit", "5000",
             "--json", "tagName,publishedAt",
         ],
-        timeout=60,
+        timeout=90,
     )
     if not raw:
         detail = f"gh stderr: {err[:200]}" if err else "is `gh` installed and authenticated?"
@@ -491,83 +776,99 @@ def _do_diff(
         result["error"] = f"couldn't parse gh output: {e}"
         return 3, result
 
+    def _in_range(tag: str) -> tuple | None:
+        ver = parse_semver(tag)
+        if not ver or not (from_v < ver <= to_v):
+            return None
+        if is_prerelease(ver) and not want_pre:
+            return None
+        if not tag_matches_library(tag, library):
+            return None
+        return ver
+
     # Range is (from, to] — exclusive of `from`. The from-version is what's
     # already installed; its own release notes describe the PREVIOUS upgrade
     # and would false-flag e.g. a 6.0.0 → 6.0.1 patch bump as breaking.
-    matching_tags: list[tuple[tuple, str]] = []
+    matching: dict[str, tuple] = {}
     for t in tag_meta:
         tag = t.get("tagName") or ""
-        ver = parse_semver(tag)
-        if not ver or not (from_v < ver <= to_v):
-            continue
-        if not tag_matches_library(tag, library):
-            continue
-        matching_tags.append((ver, tag))
+        ver = _in_range(tag)
+        if ver:
+            matching[tag] = ver
 
     # `gh release list` windows to the most recent 5000 releases. A busy
-    # Changesets monorepo (vercel/ai ships ~40 packages) blows past that in
-    # months, silently hiding older tags — ai@6.0.0 was already outside the
-    # window while ai@7.x shipped. Backfill ALL of this package's tags via
-    # the refs API, prefix-filtered so the response stays small.
+    # repo blows past that in months (vercel/ai ships ~40 packages; next.js
+    # ships canaries daily), silently hiding older tags. Backfill via the
+    # refs API, prefix-filtered per major so the response stays small. Only
+    # tags that HAVE a release are kept — the body comes from the release.
     if len(tag_meta) >= 4999:
-        refs, _ = run(
-            [
-                "gh", "api", "--paginate",
-                f"repos/{owner_repo}/git/matching-refs/tags/{library}@",
-                "--jq", ".[].ref",
-            ],
-            timeout=120,
-        )
-        seen_tags = {tag for _, tag in matching_tags}
-        for ref in refs.splitlines():
-            tag = ref.removeprefix("refs/tags/")
-            if tag in seen_tags:
-                continue
-            ver = parse_semver(tag)
-            if not ver or not (from_v < ver <= to_v):
-                continue
-            if not tag_matches_library(tag, library):
-                continue
-            matching_tags.append((ver, tag))
+        released = {t.get("tagName") for t in tag_meta}
+        prefixes = {f"{library}@"}
+        for major in range(from_v[0], to_v[0] + 1):
+            prefixes |= {f"v{major}.", f"{major}."}
+        for prefix in sorted(prefixes):
+            refs, _ = run(
+                [
+                    "gh", "api", "--paginate",
+                    f"repos/{owner_repo}/git/matching-refs/tags/{prefix}",
+                    "--jq", ".[].ref",
+                ],
+                timeout=120,
+            )
+            for ref in refs.splitlines():
+                tag = ref.removeprefix("refs/tags/")
+                if tag in matching or tag in released:
+                    continue
+                ver = _in_range(tag)
+                if ver:
+                    matching[tag] = ver
 
-    if not matching_tags:
-        fallback = _changelog_at_tag(owner_repo, to_version)
-        if fallback:
-            result["changelog_fallback"] = fallback
+    ordered = sorted(matching.items(), key=lambda kv: kv[1])
+    bodies: list[str | None] = []
+    if ordered:
+        # A major-version range can span dozens of releases; fetch bodies in
+        # parallel. 4 workers here (not 8): `audit --fetch-diffs` already
+        # runs 8 _do_diff calls concurrently, so worst-case `gh` stays ≤ 32.
+        with ThreadPoolExecutor(max_workers=min(4, len(ordered))) as ex:
+            bodies = list(ex.map(_release_body, [tag for tag, _ in ordered]))
+
+    for (tag, ver), body in zip(ordered, bodies, strict=True):
+        if body is not None:
+            _append(tag, ver, body)
+    if result["releases"]:
+        result["lookup"] = "list"
+        return 0, result
+
+    to_tags = _existing_tags(owner_repo, library, to_version)
+    fallback = _changelog_fallback(owner_repo, to_tags, directory, from_v, to_v)
+    if fallback:
+        result["changelog_fallback"] = fallback
+        return 0, result
+
+    from_tags = _existing_tags(owner_repo, library, from_version)
+    if from_tags and to_tags:
+        commits = _commits_fallback(owner_repo, from_tags[0], to_tags[0])
+        if commits:
+            result["commits_fallback"] = commits
             return 0, result
-        result["error"] = (
-            f"no tags in {owner_repo} match {library} between "
-            f"{from_version} and {to_version} (scanned {len(tag_meta)} releases)"
-        )
-        return 1, result
 
-    matching_tags.sort()
+    missing = [v for v, tags in ((from_version, from_tags), (to_version, to_tags)) if not tags]
+    result["error"] = (
+        f"no release notes for {library} {from_version} → {to_version} in "
+        f"{owner_repo}: no GitHub releases in range (scanned {len(tag_meta)}), "
+        "no CHANGELOG with a heading in range"
+        + (f", and no tag for {', '.join(missing)}" if missing else "")
+    )
+    return 1, result
 
-    def _release_body(tag: str) -> str:
-        body, _ = run(
-            ["gh", "release", "view", tag, "--repo", owner_repo, "--json", "body", "--jq", ".body"],
-            timeout=15,
-        )
-        return body
 
-    # A major-version range can span dozens of releases; fetch bodies in
-    # parallel. 4 workers here (not 8): `audit --fetch-diffs` already runs
-    # 8 _do_diff calls concurrently, so worst-case `gh` processes stay ≤ 32.
-    with ThreadPoolExecutor(max_workers=min(4, len(matching_tags))) as ex:
-        bodies = list(ex.map(_release_body, [tag for _, tag in matching_tags]))
-
-    for (ver, tag), body in zip(matching_tags, bodies):
-        breaking_blocks = [m.group(0).strip() for m in _BREAKING_BLOCK_RE.finditer(body or "")]
-        version_str = ".".join(str(x) for x in ver[:3])
-        if ver[3] != ("~",):
-            version_str += "-" + ver[3][0]
-        result["releases"].append({
-            "tag": tag,
-            "version": version_str,
-            "body": body or "",
-            "breaking_blocks": breaking_blocks,
-        })
-    return 0, result
+def diff_breaking_blocks(result: dict) -> list[str]:
+    """Every breaking block a diff result found, whichever source it came
+    from (releases, CHANGELOG fallback, or conventional-commit subjects)."""
+    blocks = [b for r in result.get("releases") or [] for b in r.get("breaking_blocks") or []]
+    for key in ("changelog_fallback", "commits_fallback"):
+        blocks += (result.get(key) or {}).get("breaking_blocks") or []
+    return blocks
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
@@ -583,14 +884,34 @@ def cmd_diff(args: argparse.Namespace) -> int:
         print(f"fresh-docs: {result['error']}", file=sys.stderr)
         return code
 
+    if result.get("no_notes"):
+        print(f"# {result['library']}: {result['from']} → {result['to']} — {result['no_notes']}")
+        return 0
+
     if result["changelog_fallback"]:
         fb = result["changelog_fallback"]
+        where = f"the {fb['ref']} tag" if fb["pinned"] else "the default branch"
+        scope = "sliced to the range" if fb["sliced"] else "head of file; no version headings matched"
         print(
             f"# {result['library']}: {result['from']} → {result['to']} — "
             f"no GitHub releases in range for {result['repo']}; "
-            f"CHANGELOG at the {result['to']} tag instead:\n#   {fb['url']}\n"
+            f"CHANGELOG at {where} instead ({scope}):\n#   {fb['url']}\n"
         )
         print(fb["content"])
+        return 0
+
+    if result["commits_fallback"]:
+        cf = result["commits_fallback"]
+        shown = len(cf["subjects"])
+        more = f", last {shown} shown" if shown < cf["total_commits"] else ""
+        print(
+            f"# {result['library']}: {result['from']} → {result['to']} — "
+            f"no GitHub releases or CHANGELOG for {result['repo']}; "
+            f"commits {cf['base']}...{cf['head']} instead "
+            f"({cf['total_commits']} commits{more}):\n#   {cf['url']}\n"
+        )
+        for s in cf["subjects"]:
+            print(f"  - {s}")
         return 0
 
     releases = result["releases"]
@@ -783,16 +1104,18 @@ def cmd_audit(args: argparse.Namespace) -> int:
                     }
 
     # --flag-breaking-only: drop any change that has zero breaking blocks
-    # across all its releases. Patches that pass this gate are the rare
+    # across all its sources. Patches that pass this gate are the rare
     # truly-risky bumps — the whole reason to scan patches in the first place.
+    # A dep whose notes couldn't be fetched is NOT "clear": it's reported as
+    # unchecked, so an outage or unresolvable repo can't pass the gate silently.
+    unchecked = [
+        {"library": c["library"], "from": c["from"], "to": c["to"],
+         "error": c["diff"]["error"]}
+        for c in changes
+        if c.get("diff") and c["diff"].get("error")
+    ]
     if args.flag_breaking_only:
-        changes = [
-            c for c in changes
-            if c.get("diff") and any(
-                r.get("breaking_blocks")
-                for r in c["diff"].get("releases", [])
-            )
-        ]
+        changes = [c for c in changes if c.get("diff") and diff_breaking_blocks(c["diff"])]
 
     report = {
         "from_ref": prev_ref,
@@ -803,23 +1126,45 @@ def cmd_audit(args: argparse.Namespace) -> int:
         "added": added,
         "removed": removed,
         "changes": changes,
+        "unchecked": unchecked,
     }
 
     # CI-gate contract: --flag-breaking-only exits 1 when anything survives
-    # the breaking filter, so pipelines can gate on exit code alone.
-    exit_code = 1 if (args.flag_breaking_only and changes) else 0
+    # the breaking filter, and 2 when nothing did but some deps couldn't be
+    # checked (an upstream failure, not a pass).
+    if args.flag_breaking_only:
+        exit_code = 1 if changes else (2 if unchecked else 0)
+    else:
+        exit_code = 0
 
     if args.json:
         print(json.dumps(report, indent=2))
         return exit_code
 
+    def _print_unchecked() -> None:
+        if not unchecked:
+            return
+        print(f"## Couldn't check ({len(unchecked)})")
+        for u in unchecked:
+            print(f"  - {u['library']}: {u['from']} → {u['to']}  ({u['error']})")
+        print()
+
     if args.flag_breaking_only and not changes:
-        print(
-            f"fresh-docs audit: no releases with breaking-change blocks "
-            f"between {prev_ref[:8]} and HEAD across "
-            f"{len(cur_deps)} dependencies. All clear."
-        )
-        return 0
+        if unchecked:
+            print(
+                f"fresh-docs audit: no breaking-change blocks found between "
+                f"{prev_ref[:8]} and HEAD, but {len(unchecked)} "
+                f"dependenc{'ies' if len(unchecked) != 1 else 'y'} couldn't be "
+                "checked — NOT all clear.\n"
+            )
+            _print_unchecked()
+        else:
+            print(
+                f"fresh-docs audit: no releases with breaking-change blocks "
+                f"between {prev_ref[:8]} and HEAD across "
+                f"{len(cur_deps)} dependencies. All clear."
+            )
+        return exit_code
     if not changes and not added and not removed:
         kind = "non-patch changes" if not args.include_patch else "changes"
         print(
@@ -828,12 +1173,19 @@ def cmd_audit(args: argparse.Namespace) -> int:
         )
         return 0
 
-    total = len(changes) + len(added) + len(removed)
-    print(
-        f"# fresh-docs audit: {total} change"
-        f"{'s' if total != 1 else ''} "
-        f"from {prev_ref[:8]} → HEAD\n"
-    )
+    if args.flag_breaking_only:
+        n = len(changes)
+        print(
+            f"# fresh-docs audit: {n} bump{'s' if n != 1 else ''} with "
+            f"breaking-change blocks from {prev_ref[:8]} → HEAD\n"
+        )
+    else:
+        total = len(changes) + len(added) + len(removed)
+        print(
+            f"# fresh-docs audit: {total} change"
+            f"{'s' if total != 1 else ''} "
+            f"from {prev_ref[:8]} → HEAD\n"
+        )
     bump_counts: dict[str, int] = {}
     for c in changes:
         bump_counts[c["bump_type"]] = bump_counts.get(c["bump_type"], 0) + 1
@@ -850,19 +1202,31 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(f"## {kind.title()} bumps ({len(by_bump[kind])})")
         for c in by_bump[kind]:
             line = f"  - {c['library']}: {c['from']} → {c['to']}"
-            if c.get("diff") and c["diff"].get("releases"):
-                rels = c["diff"]["releases"]
-                breaking_count = sum(
-                    len(r["breaking_blocks"]) for r in rels
-                )
-                line += f"  ({len(rels)} releases"
+            d = c.get("diff")
+            if d and not d.get("error"):
+                if d.get("releases"):
+                    n = len(d["releases"])
+                    source = f"{n} release{'s' if n != 1 else ''}"
+                elif d.get("changelog_fallback"):
+                    source = "CHANGELOG"
+                elif d.get("commits_fallback"):
+                    source = f"{d['commits_fallback']['total_commits']} commits, no notes"
+                elif d.get("no_notes"):
+                    source = "no release notes upstream"
+                else:
+                    source = "no notes"
+                breaking_count = len(diff_breaking_blocks(d))
                 if breaking_count:
-                    line += f", {breaking_count} breaking block"
-                    line += "s" if breaking_count != 1 else ""
-                line += ")"
-            elif c.get("diff") and c["diff"].get("error"):
-                line += f"  (diff unavailable: {c['diff']['error'][:60]}…)"
+                    source += f", {breaking_count} breaking block"
+                    source += "s" if breaking_count != 1 else ""
+                line += f"  ({source})"
+            elif d:
+                line += "  (couldn't check — see below)"
             print(line)
+            if args.flag_breaking_only and d:
+                for block in diff_breaking_blocks(d):
+                    for bl in block.splitlines()[:12]:
+                        print(f"      {bl}")
         print()
     if added and not args.flag_breaking_only:
         print(f"## Added ({len(added)})")
@@ -874,6 +1238,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
         for name, ver in removed.items():
             print(f"  - {name}@{ver}")
         print()
+    _print_unchecked()
     return exit_code
 
 

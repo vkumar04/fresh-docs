@@ -57,13 +57,15 @@ fresh-docs llms <library> --subpage <regex>   # for index-format llms.txt (absol
 # Any docs page — browser UA, HTML strip + entity decode
 fresh-docs page <url>
 
-# GitHub release notes between two semver tags (breaking-change-aware,
-# falls back to CHANGELOG.md at the tag when the repo doesn't publish releases)
+# GitHub release notes between two semver tags (breaking-change-aware).
+# No releases? Falls back to CHANGELOG.md sliced to the range (at the tag, then
+# the default branch), then to commit subjects between the two tags.
 fresh-docs diff <library> <fromVersion> <toVersion> [--json] [--ecosystem npm|pypi|hex]
 
 # Audit every package.json dep bump since a commit (dirty tree → diffs against HEAD)
 fresh-docs audit [--since <ref>] [--include-patch] [--packages a,b] [--fetch-diffs] [--json]
 fresh-docs audit --flag-breaking-only   # exits 1 if any bump has a Breaking/Major Changes block → CI gate
+                                        # exits 2 if none did but some deps couldn't be checked
 
 # Verify every URL in the built-in llms.txt map (status + HTML-fallback detection)
 fresh-docs check-map
@@ -141,7 +143,7 @@ fresh-docs check-map
 python3 test_fresh_docs.py
 ```
 
-Stdlib-only `unittest` covering semver/tag parsing (including Changesets `@scope/pkg@1.2.3` tags), breaking-block extraction (`Breaking` and Changesets `Major Changes` headings), bump classification, HTML-fallback detection, and the `--flag-breaking-only` exit-code contract.
+Stdlib-only `unittest` covering semver/tag parsing (including Changesets `@scope/pkg@1.2.3` tags and §11 pre-release ordering), GitHub URL parsing (dotted repo names like `vercel/next.js`), version-pinned repo resolution, CHANGELOG range slicing, the diff fallback chain (direct lookup → release list → CHANGELOG → commits) with `gh` mocked, breaking-block extraction, bump classification, HTML-fallback detection, and the `--flag-breaking-only` exit-code contract (including unchecked deps).
 
 ## License
 

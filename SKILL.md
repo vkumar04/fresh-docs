@@ -111,11 +111,15 @@ fresh-docs diff ecto 3.12.0 3.13.0 --ecosystem hex   # force registry on name co
 ```
 
 The CLI:
-1. Resolves the GitHub repo via npm `repository.url`, falling back to PyPI, then hex.pm (`--ecosystem npm|pypi|hex` forces one when a name like `ecto` is claimed in several registries).
-2. Fetches all releases via `gh` — with a prefix-filtered tags-API backfill for huge Changesets monorepos where `gh release list`'s most-recent-5000 window silently hides older tags (vercel/ai).
-3. Parses each `tag_name` as semver (handles `v1.2.3`, `1.2.3`, `pkg@1.2.3`, AND `@scope/pkg@1.2.3`) and filters to `(from, to]` — exclusive of `from`, whose notes describe the previous upgrade.
-4. For each release (fetched in parallel), prints the body — extracting `## Breaking` / `### 🚨 Breaking` / Changesets-style `### Major Changes` sub-blocks when present, otherwise the first 50 lines.
-5. If no releases exist in range (common in Elixir — ecto's last GitHub release is v3.4.5), automatically falls back to the raw `CHANGELOG.md` at the to-version tag.
+1. Resolves the GitHub repo from the **to-version's** npm metadata (packages move repos: `prisma@7.10.1` lives in prisma/orm while `latest` points at prisma/prisma-cli), then PyPI, then hex.pm. If npm knows the package, auto mode trusts it and never falls through — that fall-through is how a name collision resolves to an unrelated repo. `--ecosystem npm|pypi|hex` forces one registry.
+2. For small npm ranges (≤25 published versions), looks each version's release up directly — fast on repos that ship daily canaries (next.js: 18s → 2s). Otherwise lists releases via `gh`, with a prefix-filtered tags-API backfill when the 5000-release window hides older tags.
+3. Parses tags as semver (`v1.2.3`, `1.2.3`, `pkg@1.2.3`, `@scope/pkg@1.2.3`; pre-release identifiers compare per semver §11) and filters to `(from, to]`. Pre-release tags are skipped unless `from` or `to` is itself a pre-release.
+4. For each release, prints the body — extracting `## Breaking` / `### 🚨 Breaking` / Changesets-style `### Major Changes` sub-blocks when present, otherwise the first 50 lines.
+5. No releases in range? Falls back, in order, to:
+   - `CHANGELOG.md` at the to-version tag (package `directory` first, then repo root), **sliced to the `(from, to]` headings** — ecto.
+   - `CHANGELOG.md` on the default branch, accepted only if it has a heading in range — radix-ui, which publishes no releases or version tags.
+   - Commit subjects between the two tags via the compare API (conventional-commit `!:` / `BREAKING` subjects count as breaking) — prisma/orm, which tags but writes no notes.
+6. `@types/*` short-circuits as "no release notes upstream" — DefinitelyTyped never publishes any.
 
 **Auditing a whole `package.json` bump at once** — right after `ncu -u`, before committing:
 
@@ -124,11 +128,12 @@ fresh-docs audit                       # bump report; dirty tree diffs against H
                                        # clean tree against the commit before the bump
 fresh-docs audit --fetch-diffs         # + GH release notes per dep (parallel)
 fresh-docs audit --flag-breaking-only  # only bumps whose notes have a Breaking/Major
-                                       # Changes block; exits 1 if any → CI gate
+                                       # Changes block; exits 1 if any → CI gate,
+                                       # 2 if none but some deps couldn't be checked
 fresh-docs audit --since v1.2.0 --json # any git ref; structured output
 ```
 
-`audit` also reports added and removed dependencies, not just version changes.
+`audit` also reports added and removed dependencies, not just version changes. Deps whose notes couldn't be fetched are listed under **Couldn't check** (and `unchecked` in `--json`) instead of being silently treated as clear.
 
 ### Step 4 — Targeted WebFetch on official docs
 
